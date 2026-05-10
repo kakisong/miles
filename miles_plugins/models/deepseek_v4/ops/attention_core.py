@@ -15,6 +15,7 @@ def sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
     Returns:
         o: (b, m, h, d)
     """
+    orig_dtype = q.dtype
     q = q.float()
     kv = kv.float()
 
@@ -41,7 +42,7 @@ def sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
     scores = scores.masked_fill(~mask_expanded, float("-inf"))
 
     scores = scores.to(torch.float32)
-    scores_max = scores.max(dim=-1).values
+    scores_max = scores.max(dim=-1).values.clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max.unsqueeze(-1))
 
     numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, kv_gathered.to(torch.float32))
@@ -57,7 +58,7 @@ def sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
 
     o = numerator / denominator.unsqueeze(-1)
 
-    return o.to(q.dtype)
+    return o.to(orig_dtype)
 
 
 def dense_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
