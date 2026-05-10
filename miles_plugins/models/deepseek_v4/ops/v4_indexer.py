@@ -106,9 +106,8 @@ class V4Indexer(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         cp_group = self.pg_collection.cp if hasattr(self.pg_collection, "cp") else None
         freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen, cp_size, cp_group, stride=1)
-        q = q.clone()
         q = einops.rearrange(q, "s b ... -> b s ...")
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], dim=-1)
         q = einops.rearrange(q, "b s ... -> s b ...")
 
         q = rotate_activation(q)

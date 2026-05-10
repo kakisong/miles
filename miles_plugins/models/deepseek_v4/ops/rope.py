@@ -42,23 +42,26 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """Apply RoPE in-place to the last dim of ``x``.
+    """Apply RoPE to the last dim of ``x``. Returns a NEW tensor (not in-place).
+
+    Bugfix: original implementation did ``y.copy_(x_rotated)`` to modify the input
+    view in place. When ``x`` was a slice of a tensor returned by a custom autograd
+    Function (TENorm, sparse_attn_tilelang…), this silently produced wrong (NaN)
+    gradients in backward. We now return a new tensor; ALL callers must capture
+    the return value (use ``torch.cat`` to combine with the un-rotated dims).
 
     ``x`` has shape ``[..., dim]`` where ``dim`` is even; the last-dim pairs are
     treated as complex numbers multiplied by ``freqs_cis``. When ``inverse=True``
     the conjugate rotation is applied (used for the indexer's inverse rope).
     """
-    y = x
-    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
-    if x.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
+    if x_complex.ndim == 3:
+        freqs_cis = freqs_cis.view(1, x_complex.size(1), x_complex.size(-1))
     else:
-        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    x = torch.view_as_real(x * freqs_cis).flatten(-2)
-    y.copy_(x)
-    return y
+        freqs_cis = freqs_cis.view(1, x_complex.size(1), 1, x_complex.size(-1))
+    return torch.view_as_real(x_complex * freqs_cis).flatten(-2).to(x.dtype)
 
 
 def wrapped_precompute_freqs_cis(

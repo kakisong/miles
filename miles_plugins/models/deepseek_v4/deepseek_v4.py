@@ -231,13 +231,11 @@ class DeepSeekV4Attention(MegatronModule):
         q_after_wq_b = self.wq_b(q)[0]
         q = q_after_wq_b.unflatten(-1, (self.n_local_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        q = q.clone()
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], dim=-1)
 
         kv_after_wkv = self.wkv(x)[0]
         kv_vanilla = self.kv_norm(kv_after_wkv)
-        kv_vanilla = kv_vanilla.clone()
-        apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
+        kv_vanilla = torch.cat([kv_vanilla[..., :-rd], apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)], dim=-1)
         if os.environ.get("MEGATRON_USE_KV_QAT", "0") == "1":
             kv_vanilla = fp8_simulate_qat(kv_vanilla, 64)
 
@@ -299,7 +297,7 @@ class DeepSeekV4Attention(MegatronModule):
         else:
             o = dense_attn_torch(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
 
-        apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
+        o = torch.cat([o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)], dim=-1)
 
         o = o.view(bsz, seqlen_local, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
