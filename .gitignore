@@ -15,6 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!examples/deepseek_v4_sft/cluster/lib/
 lib64/
 parts/
 sdist/
@@ -131,6 +132,7 @@ celerybeat.pid
 .env
 .venv
 env/
+!examples/deepseek_v4_sft/cluster/env/
 venv/
 ENV/
 env.bak/
