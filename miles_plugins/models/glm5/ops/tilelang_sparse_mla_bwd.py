@@ -78,7 +78,16 @@ def postprocess(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        # NOTE(2026-05-10): mirrors the V4 fix in
+        # miles_plugins/models/deepseek_v4/ops/kernel/tilelang_sparse_mla_bwd.py.
+        # The aggressive shared-memory merge pass aliases acc_dkv_shared (fp32)
+        # with Q_shared / KV_shared / dQ_shared (bf16) without inserting the
+        # syncs needed when the producer/consumer dtypes differ. The split_store
+        # atomic_addx4 path then writes fp32 bytes that the next iteration reads
+        # back as bf16 — on V4 this produced 100% NaN gradients on production
+        # shapes. GLM-5's D=512 + D_tail=64 layout has not been observed to
+        # trip the alias collision, but the flag is unsafe by construction.
+        # tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     },
 )
 def bwd(
