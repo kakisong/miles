@@ -41,6 +41,18 @@ class DiffInfo:
 def compute_diff(baseline: torch.Tensor, target: torch.Tensor) -> DiffInfo:
     x = baseline.flatten().float()
     y = target.flatten().float()
+    # Guard: NaN in either tensor is always a real bug. Without this, the
+    # `denom > 0` test below silently returns 0.0 when denom is NaN, hiding
+    # broken kernels behind a fake `rel_diff=0` pass — that's how the V4
+    # tilelang bwd shipped with 100% NaN gradients and "passing" tests.
+    assert not torch.isnan(y).any(), (
+        f"target tensor contains {torch.isnan(y).sum().item()} NaN values "
+        f"(out of {y.numel()})"
+    )
+    assert not torch.isnan(x).any(), (
+        f"baseline tensor contains {torch.isnan(x).sum().item()} NaN values "
+        f"(out of {x.numel()})"
+    )
     abs_diff = (x - y).abs()
 
     xy = (x * y).sum()
