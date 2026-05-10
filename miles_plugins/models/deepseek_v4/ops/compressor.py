@@ -156,7 +156,8 @@ class DeepSeekV4Compressor(nn.Module):
 
         freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group, stride=ratio)
 
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+        rd = self.rope_head_dim
+        kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], dim=-1)
 
         if self.rotate:
             kv = rotate_activation(kv)
