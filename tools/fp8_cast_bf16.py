@@ -8,8 +8,70 @@ import torch
 import triton
 import triton.language as tl
 from safetensors.torch import load_file, save_file
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from tqdm import tqdm
+
+# Inlined from sglang upstream (sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM).
+# The miles `latest`/`dev` x86_64 image still uses sglang nightly 20260103, which
+# predates DeepSeek-V4. Until those images are updated, ship this remap inline so
+# fp8_cast_bf16 doesn't require sglang's V4 module.
+from typing import Optional
+
+
+class DeepseekV4ForCausalLM:  # noqa: N801 — match upstream class name
+    @staticmethod
+    def remap_weight_name_to_dpsk_hf_format(
+        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+    ) -> str:
+        if name == "embed.weight":
+            return "model.embed_tokens.weight"
+        if name == "head.weight":
+            return "lm_head.weight"
+        if name == "norm.weight":
+            return "model.norm.weight"
+        if name.startswith("hc_head_"):
+            return "model." + name
+
+        if is_nextn and name.startswith("mtp."):
+            parts = name.split(".", 2)
+            if len(parts) >= 3:
+                rest = parts[2]
+                nextn_spec_prefixes = [
+                    "e_proj", "h_proj", "emb", "enorm", "hnorm",
+                    "norm", "head", "hc_head",
+                ]
+                is_nextn_spec = any(rest.startswith(p) for p in nextn_spec_prefixes)
+                if is_nextn_spec:
+                    if rest.startswith("emb.tok_emb"):
+                        rest = rest.replace("emb.tok_emb", "embed_tokens")
+                    elif rest == "norm.weight":
+                        rest = "shared_head.norm.weight"
+                    elif rest.startswith("head."):
+                        rest = "shared_head.head.weight"
+                    elif rest == "e_proj.scale":
+                        rest = "e_proj.weight_scale_inv"
+                    elif rest == "h_proj.scale":
+                        rest = "h_proj.weight_scale_inv"
+                name = f"model.layers.{num_hidden_layers}." + rest
+
+        if name.startswith("layers."):
+            name = "model." + name
+        name = name.replace(".attn.", ".self_attn.")
+        name = name.replace(".ffn.", ".mlp.")
+        name = name.replace(".attn_norm.", ".input_layernorm.")
+        name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
+
+        if "self_attn" in name:
+            name = name.replace(".scale", ".weight_scale_inv")
+
+        name = name.replace(".gate.tid2eid", ".topk.tid2eid")
+        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
+        name = name.replace(".w1.", ".gate_proj.")
+        name = name.replace(".w2.", ".down_proj.")
+        name = name.replace(".w3.", ".up_proj.")
+        if "mlp" in name:
+            name = name.replace(".scale", ".weight_scale_inv")
+
+        return name
 
 
 @triton.jit
