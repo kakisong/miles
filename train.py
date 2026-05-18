@@ -86,6 +86,20 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
+        # Warmup save: trigger one save after the first optimizer step in this process to
+        # prime dist_checkpointing's lazy init (pinned-mem pool / IPC handles / CUDA streams)
+        # at low iter. Without this, 64K-shape first save at iter ≥ ~50 hits cudaErrorInvalidValue
+        # in filesystem_async.py:226 D2H (see examples/deepseek_v4_sft/WRITEUP.md module 3 Problem 8).
+        # Must run AFTER actor_model.async_train so precision-aware-optimizer's master_param is
+        # populated (otherwise save_checkpoint → KeyError: 'master_param'). Cost: one extra ckpt
+        # at iter_<start+1>; --save-retain-interval reaps it on the next regular save.
+        is_first_step = rollout_id == args.start_rollout_id
+        if is_first_step:
+            if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
+                actor_model.save_model(rollout_id, force_sync=True)
+            if args.use_critic:
+                critic_model.save_model(rollout_id, force_sync=True)
+
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             save(rollout_id)
 
