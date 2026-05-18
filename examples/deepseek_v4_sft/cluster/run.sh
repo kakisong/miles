@@ -34,6 +34,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 # ---------- 解析参数 ----------------------------------------------------------
 DRY_RUN=0
+PROFILE_ENABLED=0
+NO_SAVE_OPTIM=0
 PRESET=""
 declare -A OVERRIDES=()
 
@@ -48,6 +50,9 @@ while [[ $# -gt 0 ]]; do
     --num-rollout)           OVERRIDES[PRESET_NUM_ROLLOUT]="$2"; shift 2 ;;
     --lr)                    OVERRIDES[PRESET_LR]="$2"; shift 2 ;;
     --lr-decay-style)        OVERRIDES[PRESET_LR_DECAY_STYLE]="$2"; shift 2 ;;
+    --lr-warmup-iters)       OVERRIDES[PRESET_LR_WARMUP_ITERS]="$2"; shift 2 ;;
+    --profile)               PROFILE_ENABLED=1; shift ;;
+    --no-save-optim)         NO_SAVE_OPTIM=1; shift ;;
     --save-interval)         OVERRIDES[PRESET_SAVE_INTERVAL]="$2"; shift 2 ;;
     --save-retain-interval)  OVERRIDES[PRESET_SAVE_RETAIN_INTERVAL]="$2"; shift 2 ;;
     --max-tokens-per-gpu)    OVERRIDES[HW_MAX_TOKENS_PER_GPU]="$2"; shift 2 ;;
@@ -85,6 +90,35 @@ for k in "${!OVERRIDES[@]}"; do
   export "$k=${OVERRIDES[$k]}"
 done
 
+# Preset can set PRESET_CPU_OFFLOAD_FLAGS="" to disable cpu-offload optimizer (saves Memcpy% but
+# costs ~40 GB GPU mem for optimizer state — V4 single-rank exceeds 95 GB, so default keeps offload).
+: "${PRESET_CPU_OFFLOAD_FLAGS=--optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d --use-precision-aware-optimizer}"
+
+# Recompute flags depend on granularity: selective rejects --recompute-method; full needs it; none omits both.
+case "${HW_RECOMPUTE_GRANULARITY:-full}" in
+  none|"") HW_RECOMPUTE_FLAGS="" ;;
+  selective) HW_RECOMPUTE_FLAGS="--recompute-granularity selective" ;;
+  *) HW_RECOMPUTE_FLAGS="--recompute-granularity $HW_RECOMPUTE_GRANULARITY --recompute-method $HW_RECOMPUTE_METHOD --recompute-num-layers $HW_RECOMPUTE_NUM_LAYERS" ;;
+esac
+
+# Optional --tool-key (datasets with separate tool spec column, e.g. albaliang agent SFT).
+# Empty by default; presets needing it set PRESET_TOOL_KEY=<column-name>.
+SFT_TOOL_KEY_FLAGS=""
+if [[ -n "${PRESET_TOOL_KEY:-}" ]]; then
+  SFT_TOOL_KEY_FLAGS="--tool-key $PRESET_TOOL_KEY"
+fi
+
+# Optional --lr-warmup-iters. Megatron's default with this unset is 0; we only emit
+# the flag when caller asked for warmup so existing presets stay byte-for-byte equal.
+LR_WARMUP_FLAGS=""
+if [[ "${PRESET_LR_WARMUP_ITERS:-0}" -gt 0 ]]; then
+  LR_WARMUP_FLAGS="--lr-warmup-iters $PRESET_LR_WARMUP_ITERS"
+fi
+
+# Profile flags are finalized below after RUN_ID is set (needs $SAVE_DIR for tb_dir).
+PROFILE_FLAGS=""
+PROFILE_TBDIR=""
+
 # ---------- preflight ----------------------------------------------------------
 source "$SCRIPT_DIR/lib/preflight.sh"
 if [[ "$PRESET" == "smoke" ]]; then
@@ -103,6 +137,16 @@ echo "[info] run id    : $RUN_ID"
 echo "[info] save dir  : $SAVE_DIR"
 echo "[info] dashboard : http://$V4_MASTER_IP:$V4_DASHBOARD_PORT"
 
+# Finalize profile flags (needs SAVE_DIR).
+if (( PROFILE_ENABLED == 1 )); then
+  : "${PROFILE_STEP_START:=5}"
+  : "${PROFILE_STEP_END:=$((PROFILE_STEP_START + 1))}"   # active=1 (PP=4 trace-safe)
+  PROFILE_TBDIR="$SAVE_DIR/profiler_traces"
+  mkdir -p "$PROFILE_TBDIR"
+  PROFILE_FLAGS="--use-pytorch-profiler --profile-step-start $PROFILE_STEP_START --profile-step-end $PROFILE_STEP_END --profile-target train_overall --tensorboard-dir $PROFILE_TBDIR"
+  echo "[info] profile  : ON  active steps [$PROFILE_STEP_START,$PROFILE_STEP_END)  tb_dir=$PROFILE_TBDIR"
+fi
+
 # ---------- 生成容器内 launch 脚本 ---------------------------------------------
 LAUNCH=$SAVE_DIR/launch_in_container.sh
 cat > "$LAUNCH" <<EOF
@@ -119,6 +163,9 @@ CKPT_ARGS=(
   --save-interval  $PRESET_SAVE_INTERVAL
   --save-retain-interval $PRESET_SAVE_RETAIN_INTERVAL
 )
+# Workaround for module 3 Problem 8 — 跳过 optimizer state save, 绕开 64K + 长跑下
+# dist_checkpointing async D2H 抛 cudaErrorInvalidValue。SFT 终态不需续训。
+[[ "$NO_SAVE_OPTIM" == "1" ]] && CKPT_ARGS+=(--no-save-optim)
 
 SFT_ARGS=(
   --rollout-function-path miles.rollout.sft_rollout.generate_rollout
@@ -135,6 +182,7 @@ SFT_ARGS=(
   --debug-train-only
 
   --loss-mask-type deepseek_v4
+  $SFT_TOOL_KEY_FLAGS
 )
 
 PERF_ARGS=(
@@ -147,9 +195,7 @@ PERF_ARGS=(
   --expert-model-parallel-size $PRESET_EP
   --expert-tensor-parallel-size $PRESET_ETP
 
-  --recompute-granularity $HW_RECOMPUTE_GRANULARITY
-  --recompute-method      $HW_RECOMPUTE_METHOD
-  --recompute-num-layers  $HW_RECOMPUTE_NUM_LAYERS
+  $HW_RECOMPUTE_FLAGS
 
   --micro-batch-size 1
   --use-dynamic-batch-size
@@ -160,11 +206,10 @@ OPTIMIZER_ARGS=(
   --optimizer adam
   --lr $PRESET_LR
   --lr-decay-style $PRESET_LR_DECAY_STYLE
+  $LR_WARMUP_FLAGS
   --weight-decay 0.1
   --adam-beta1 0.9 --adam-beta2 0.95
-  --optimizer-cpu-offload
-  --overlap-cpu-optimizer-d2h-h2d
-  --use-precision-aware-optimizer
+  $PRESET_CPU_OFFLOAD_FLAGS
 )
 
 MISC_ARGS=(
@@ -187,6 +232,7 @@ MISC_ARGS=(
   --no-offload-rollout
   --use-fault-tolerance
   --dump-details $SAVE_DIR/dump_details
+  $PROFILE_FLAGS
 )
 
 RUNTIME_ENV='{
@@ -200,7 +246,8 @@ RUNTIME_ENV='{
     "GLOO_SOCKET_IFNAME": "eth0",
     "NCCL_SOCKET_IFNAME": "eth0",
     "LD_PRELOAD": "/usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so",
-    "MEGATRON_SPARSE_ATTN_IMPL": "$PRESET_ATTN_IMPL"
+    "MEGATRON_SPARSE_ATTN_IMPL": "$PRESET_ATTN_IMPL",
+    "PYTORCH_CUDA_ALLOC_CONF": "${HW_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   }
 }'
 

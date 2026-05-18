@@ -53,10 +53,13 @@ docker run -d --name $V4_CONTAINER \
     -e CUDA_DEVICE_MAX_CONNECTIONS=1 \
     -e MASTER_ADDR=$V4_MASTER_IP \
     -e NCCL_IB_DISABLE=0 \
+    -e TZ=${V4_TZ:-Asia/Shanghai} \
     -w $V4_MILES \
     $V4_IMAGE \
     sleep infinity >/dev/null
 docker exec $V4_CONTAINER bash -lc 'pip install -e . --quiet --no-deps 2>&1 | tail -1' >/dev/null
+# DSA indexer 惰性 import fast_hadamard_transform —— 镜像不带,手装 (PyPI sdist 缺源)
+docker exec -e HTTPS_PROXY=$V4_HTTP_PROXY $V4_CONTAINER bash -lc 'python -c "import fast_hadamard_transform" 2>/dev/null || pip install --quiet --no-build-isolation "git+https://github.com/Dao-AILab/fast-hadamard-transform.git" 2>&1 | tail -1' >/dev/null
 echo "[$IP] container ready"
 EOF
 }
@@ -77,11 +80,31 @@ RAY_WORKER_SCRIPT=$V4_OUT/.ray_worker.sh
 cat > "$RAY_HEAD_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -e
+# 时区 —— Ray dashboard / log 时间戳用 TZ env,默认 Asia/Shanghai
+export TZ='${V4_TZ:-Asia/Shanghai}'
+
 # Ray dashboard 嵌入 Grafana 必需的 env vars(只在 ray start 时读)
+# HOST 给 Ray head 内部 health check(容器内 curl,内网);IFRAME_HOST 给浏览器(公网 via Caddy)
 export RAY_GRAFANA_HOST=$V4_GRAFANA_HOST
-export RAY_GRAFANA_IFRAME_HOST=$V4_GRAFANA_HOST
+export RAY_GRAFANA_IFRAME_HOST=$V4_GRAFANA_IFRAME_HOST
 export RAY_PROMETHEUS_HOST=$V4_PROMETHEUS_HOST
 export RAY_PROMETHEUS_NAME=Prometheus
+
+# GCS 外部 Redis (head fault tolerance, optional) —— V4_REDIS_HOST 空则跳过
+# workers 只连 GCS,不直接访问 Redis
+_REDIS_HOST='${V4_REDIS_HOST:-}'
+_REDIS_PORT='${V4_REDIS_PORT:-6379}'
+_REDIS_PASSWORD='${V4_REDIS_PASSWORD:-}'
+_CLUSTER_NS='${V4_CLUSTER_NAME:-default}'
+REDIS_ARGS=()
+if [ -n "\$_REDIS_HOST" ]; then
+    export RAY_REDIS_ADDRESS="\$_REDIS_HOST:\$_REDIS_PORT"
+    # namespace 给 GCS key 加前缀,避免同 Redis 上多个 Ray 集群互踩
+    export RAY_external_storage_namespace="\$_CLUSTER_NS"
+    [ -n "\$_REDIS_PASSWORD" ] && REDIS_ARGS+=(--redis-password="\$_REDIS_PASSWORD")
+    echo "[ray-head] GCS external Redis: \$RAY_REDIS_ADDRESS (ns=\$_CLUSTER_NS)"
+fi
+
 ray stop --force 2>/dev/null || true
 ray start --head \\
     --node-ip-address=$V4_MASTER_IP \\
@@ -89,7 +112,7 @@ ray start --head \\
     --num-gpus=$V4_NUM_GPUS_PER_NODE \\
     --dashboard-host=0.0.0.0 \\
     --dashboard-port=$V4_DASHBOARD_PORT \\
-    --disable-usage-stats
+    --disable-usage-stats "\${REDIS_ARGS[@]}"
 EOF
 chmod +x "$RAY_HEAD_SCRIPT"
 
@@ -97,6 +120,7 @@ cat > "$RAY_WORKER_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 # 第一个参数是 worker 自己的 IP
 set -e
+export TZ='__TZ__'
 WORKER_IP="$1"
 ray stop --force 2>/dev/null || true
 ray start --address=__MASTER_IP__:__RAY_PORT__ \
@@ -104,7 +128,7 @@ ray start --address=__MASTER_IP__:__RAY_PORT__ \
     --num-gpus=__NUM_GPUS__ \
     --disable-usage-stats
 EOF
-sed -i "s|__MASTER_IP__|$V4_MASTER_IP|g; s|__RAY_PORT__|$V4_RAY_PORT|g; s|__NUM_GPUS__|$V4_NUM_GPUS_PER_NODE|g" "$RAY_WORKER_SCRIPT"
+sed -i "s|__MASTER_IP__|$V4_MASTER_IP|g; s|__RAY_PORT__|$V4_RAY_PORT|g; s|__NUM_GPUS__|$V4_NUM_GPUS_PER_NODE|g; s|__TZ__|${V4_TZ:-Asia/Shanghai}|g" "$RAY_WORKER_SCRIPT"
 chmod +x "$RAY_WORKER_SCRIPT"
 
 echo "=== Phase 2: master 起 ray head ==="
