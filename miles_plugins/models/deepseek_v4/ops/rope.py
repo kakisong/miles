@@ -67,7 +67,12 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 def wrapped_precompute_freqs_cis(
     config: TransformerConfig, rope_head_dim: int, base: float, yarn_disabled: bool = False
 ):
-    max_seq_len = 65536
+    # 65536 was the trained context; CP-packed seqs can spill ~5% past this due to
+    # dynamic-batch padding alignment (observed seqlen_local=8448 × CP=8 = 67584 at
+    # 64K shape). Pre-allocate enough freq positions to absorb that overhead. The
+    # YaRN scaling factor (4-16x) means this table is mathematically valid out to
+    # 4-16x original_max_position_embeddings (~262K-1M), so 2x is safely in range.
+    max_seq_len = 131072
 
     # yarn_disabled=True → original_seq_len=0, which makes precompute_freqs_cis skip the YaRN
     # correction-range interpolation. Used by 0415 for pure-window (compress_ratio==0) layers.
