@@ -116,7 +116,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.sleep()
             return
 
-        start_rollout_id = loaded_rollout_id + 1
+        # Megatron tracker iteration is 1-indexed step count = next rollout_id.
+        # Pairs with `save(rollout_id + 1)` below — keeps `--save-retain-interval`
+        # working (iter_0000100 % 100 == 0 retain; was iter_0000099 % 100 == 99 → bug).
+        start_rollout_id = loaded_rollout_id
 
         self.weights_backuper = TensorBackuper.create(
             source_getter=lambda: named_params_and_buffers(
@@ -481,7 +484,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        # +1 converts 0-indexed rollout_id to 1-indexed Megatron iteration
+        # (= count of completed rollouts). Aligns with FSDP backend's `step_id =
+        # iteration + 1` convention and makes `--save-retain-interval` work.
+        save(rollout_id + 1, self.model, self.optimizer, self.opt_param_scheduler)
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
