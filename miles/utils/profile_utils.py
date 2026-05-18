@@ -51,13 +51,44 @@ def _profile_simple_loop(iterator, args, name):
         return
 
     torch_profiler = _create_torch_profiler(args, name=name)
+    if torch_profiler is None:
+        yield from iterator
+        return
     torch_profiler.start()
     for item in iterator:
         yield item
         torch_profiler.step()
 
 
+# Subset of ranks that emit traces. Three ranks (head, mid, last PP stage) keep total
+# trace volume manageable on multi-node profiles. Override with MILES_PROFILE_RANKS env
+# var (comma-separated rank ids) to retune for non-PP=4 shapes.
+_DEFAULT_PROFILE_RANKS = {0, 32, 48}
+
+
+def _selected_profile_ranks():
+    import os
+    raw = os.environ.get("MILES_PROFILE_RANKS")
+    if not raw:
+        return _DEFAULT_PROFILE_RANKS
+    return {int(x) for x in raw.split(",") if x.strip()}
+
+
 def _create_torch_profiler(args, name):
+    """Build torch.profiler.profile for the selected rank, or return None elsewhere.
+
+    Why default record_shapes/with_stack/profile_memory off:
+      with_stack=True deadlocks NCCL on 64-rank H20+RoCE (verified 2026-05-12).
+      record_shapes / profile_memory bloat trace size + slow steps without adding
+      what we want here (kernel-level wall breakdown for CP/EP collectives).
+    How to apply:
+      override MILES_PROFILE_RANKS env var to pick different ranks; if you need the
+      heavy options for a one-off, flip locally in this function (don't promote
+      back to defaults without re-verifying NCCL stability).
+    """
+    rank = torch.distributed.get_rank()
+    if rank not in _selected_profile_ranks():
+        return None
     return torch.profiler.profile(
         schedule=torch.profiler.schedule(
             # TODO the train_actor and train_log_probs ones may need to have different args to control step
@@ -68,13 +99,13 @@ def _create_torch_profiler(args, name):
         ),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
             args.tensorboard_dir,
-            worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
+            worker_name=f"{name}_rank_{rank}",
             use_gzip=True,
         ),
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True,
-        with_flops=True,
+        record_shapes=False,
+        with_stack=False,
+        profile_memory=False,
+        with_flops=False,
     )
 
 
