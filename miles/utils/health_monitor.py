@@ -3,6 +3,7 @@ import threading
 
 import ray
 
+from miles.ray.rollout.server_group import ServerGroup
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ class RolloutHealthMonitor:
     - stop(): Stop the monitor thread completely (called during dispose)
     """
 
-    def __init__(self, server_group, args):
+    def __init__(self, server_group: ServerGroup, args):
         self._server_group = server_group
 
         self._thread = None
@@ -153,25 +154,6 @@ class RolloutHealthMonitor:
             logger.error(
                 f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
             )
-            self._kill_engine(rollout_engine_id=rollout_engine_id)
+            self._server_group.stop_engines(rollout_engine_id=rollout_engine_id)
         else:
             logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
-
-    def _kill_engine(self, rollout_engine_id: int):
-        logger.info(f"Killing server group {rollout_engine_id}...")
-        for i in range(
-            rollout_engine_id * self._server_group.nodes_per_engine,
-            (rollout_engine_id + 1) * self._server_group.nodes_per_engine,
-        ):
-            engine = self._server_group.all_engines[i]
-            if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
-            else:
-                logger.info(f"Engine at index {i} is already None")
-            self._server_group.all_engines[i] = None

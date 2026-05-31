@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 import os
 from typing import Any
 
@@ -12,6 +13,9 @@ from miles.ray.rollout.addr_allocator import (
 )
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils import dumper_utils
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -147,6 +151,25 @@ class ServerGroup:
             for rank, engine in rollout_engines
         ]
         return init_handles, port_cursors
+
+    def stop_engines(self, rollout_engine_id: int):
+        logger.info(f"Killing server group {rollout_engine_id}...")
+        for i in range(
+            rollout_engine_id * self.nodes_per_engine,
+            (rollout_engine_id + 1) * self.nodes_per_engine,
+        ):
+            engine = self.all_engines[i]
+            if engine:
+                logger.info(f"Shutting down and killing engine at index {i}")
+                try:
+                    ray.get(engine.shutdown.remote())
+                    ray.kill(engine)
+                    logger.info(f"Successfully killed engine at index {i}")
+                except Exception as e:
+                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
+            else:
+                logger.info(f"Engine at index {i} is already None")
+            self.all_engines[i] = None
 
     def offload(self):
         if not self.needs_offload:
