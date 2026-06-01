@@ -180,6 +180,14 @@ class DeepSeekV4Attention(MegatronModule):
             config, rope_head_dim=self.rope_head_dim, base=rope_base, yarn_disabled=yarn_disabled
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        self._dsv4_debug_tensors = None
+
+    def _debug_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if os.environ.get("MILES_DSV4_TRACE_INTERNALS", "0") != "1":
+            return
+        if self._dsv4_debug_tensors is None:
+            self._dsv4_debug_tensors = {}
+        self._dsv4_debug_tensors[name] = tensor.detach().float().cpu()
 
     def sharded_state_dict(
         self,
@@ -232,12 +240,16 @@ class DeepSeekV4Attention(MegatronModule):
         q = q_after_wq_b.unflatten(-1, (self.n_local_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], dim=-1)
+        self._debug_tensor("q_after_rope", q)
 
         kv_after_wkv = self.wkv(x)[0]
         kv_vanilla = self.kv_norm(kv_after_wkv)
         kv_vanilla = torch.cat([kv_vanilla[..., :-rd], apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)], dim=-1)
         if os.environ.get("MEGATRON_USE_KV_QAT", "0") == "1":
-            kv_vanilla = fp8_simulate_qat(kv_vanilla, 64)
+            kv_vanilla = torch.cat(
+                [fp8_simulate_qat(kv_vanilla[..., :-rd].contiguous(), 64), kv_vanilla[..., -rd:]], dim=-1
+            )
+        self._debug_tensor("kv_vanilla_after_rope_qat", kv_vanilla)
 
         seqlen_global = seqlen_local * self.cp_size
         q_positions = get_q_positions_for_cp(
@@ -296,13 +308,17 @@ class DeepSeekV4Attention(MegatronModule):
             o = sparse_attn_torch(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
             o = dense_attn_torch(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        self._debug_tensor("attention_core", o)
 
         o = torch.cat([o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)], dim=-1)
+        self._debug_tensor("attention_after_inverse_rope", o)
 
         o = o.view(bsz, seqlen_local, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        self._debug_tensor("after_wo_a", o)
         x, _ = self.wo_b(o.flatten(2))
+        self._debug_tensor("after_wo_b", x)
 
         output = einops.rearrange(x, "b s d -> s b d")
 

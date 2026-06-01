@@ -165,8 +165,13 @@ class DeepSeekV4Compressor(nn.Module):
                 kv = fp8_simulate_qat(kv, 128)
         else:
             if os.environ.get("MEGATRON_USE_KV_QAT", "0") == "1":
-                kv = kv.clone()
-                kv[..., : self.nope_head_dim] = fp8_simulate_qat(kv[..., : self.nope_head_dim], 64)
+                kv = torch.cat(
+                    [
+                        fp8_simulate_qat(kv[..., : self.nope_head_dim].contiguous(), 64),
+                        kv[..., self.nope_head_dim :],
+                    ],
+                    dim=-1,
+                )
             else:
                 pass
 

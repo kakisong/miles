@@ -3,9 +3,7 @@ from .kernel.act_quant import act_quant
 
 
 def fp8_simulate(x: torch.Tensor, block_size: int):
-    y, scale = act_quant(x.contiguous(), block_size, "ue8m0")
-    y = y.unflatten(-1, (-1, block_size)).float() * scale.unsqueeze(-1)
-    return y.flatten(-2).to(x.dtype)
+    return act_quant(x.contiguous(), block_size, scale_fmt=None, scale_dtype=torch.float32, inplace=True)
 
 
 class DeepSeekV4LinearQATFunc(torch.autograd.Function):

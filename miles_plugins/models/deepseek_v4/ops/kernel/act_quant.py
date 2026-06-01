@@ -14,6 +14,7 @@ _pass_configs = {
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
 FP32 = "float32"
+FE8M0 = "float8_e8m0fnu"
 
 
 def _fast_log2_ceil(x):
@@ -33,14 +34,18 @@ def _fast_round_scale(amax, fp8_max_inv):
 
 
 @tilelang.jit(pass_configs=_pass_configs)
-def act_quant_kernel(N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False):
+def act_quant_kernel(
+    N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False, inplace=False
+):
     M = T.symbolic("M")
     fp8_min = -448.0
     fp8_max = 448.0
     fp8_max_inv = 1 / fp8_max
-    num_stages = 0 if round_scale else 2
+    num_stages = 0 if round_scale or inplace else 2
     blk_m = 32
     group_size = block_size
+    compute_dtype = FP32
+    out_dtype = in_dtype if inplace else out_dtype
 
     @T.prim_func
     def act_quant_kernel_(
@@ -54,8 +59,8 @@ def act_quant_kernel(N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtyp
         ):
             x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
             x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
-            amax_local = T.alloc_fragment((blk_m,), scale_dtype)
-            s_local = T.alloc_fragment((blk_m,), scale_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
             y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
             y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
 
@@ -69,10 +74,19 @@ def act_quant_kernel(N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtyp
                         s_local[i] = _fast_round_scale(amax_local[i], fp8_max_inv)
                     else:
                         s_local[i] = amax_local[i] * fp8_max_inv
-                for i, j in T.Parallel(blk_m, group_size):
-                    y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)
+                if inplace:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(
+                            out_dtype,
+                            T.Cast(compute_dtype, T.Cast(out_dtype, T.clamp(
+                                x_local[i, j] / s_local[i], fp8_min, fp8_max
+                            ))) * s_local[i],
+                        )
+                else:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)
                 for i in T.Parallel(blk_m):
-                    S[pid_m * blk_m + i, pid_n] = s_local[i]
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
                 T.copy(y_local, y_shared)
                 T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
 
@@ -80,15 +94,29 @@ def act_quant_kernel(N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtyp
 
 
 def act_quant(
-    x: torch.Tensor, block_size: int = 128, scale_fmt: str | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
+    inplace: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert (
         x.size(-1) % block_size == 0
     ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
     N = x.size(-1)
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
-    kernel = act_quant_kernel(N, block_size, round_scale=scale_fmt is not None)
+    tl_scale_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
+    y = torch.empty_like(x) if inplace else torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    s = x.new_empty(*x.size()[:-1], N // block_size, dtype=scale_dtype)
+    kernel = act_quant_kernel(
+        N,
+        block_size,
+        scale_dtype=tl_scale_dtype,
+        round_scale=scale_fmt is not None,
+        inplace=inplace,
+    )
     kernel(x.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
+    if inplace:
+        x.copy_(y)
+        return x
     return y, s
