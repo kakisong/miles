@@ -2,14 +2,12 @@ import argparse
 import json
 import logging
 import os
+import sys
 from typing import Any
 
 import yaml
-from sglang_router.launch_router import RouterArgs
 from transformers import AutoConfig
 
-from miles.backends.sglang_utils.arguments import add_sglang_arguments
-from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.utils.environ import enable_experimental_rollout_refactor
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from miles.utils.logging_utils import configure_logger
@@ -17,6 +15,75 @@ from miles.utils.misc import load_function
 from miles.utils.transformers_patch import with_transformers_patch
 
 logger = logging.getLogger(__name__)
+
+
+def _sft_only_requested(argv: list[str] | None = None) -> bool:
+    argv = sys.argv[1:] if argv is None else argv
+    env_value = os.environ.get("MILES_SFT_ONLY", "").lower()
+    if env_value in {"1", "true", "yes", "on"}:
+        return True
+    return any(
+        arg == "--sft-only" or arg == "--debug-train-only" or arg.startswith("--load-debug-rollout-data")
+        for arg in argv
+    )
+
+
+def _missing_sglang_error(exc: ModuleNotFoundError) -> bool:
+    name = exc.name or ""
+    return name == "sglang" or name.startswith("sglang.") or name == "sglang_router"
+
+
+def _add_sglang_stub_arguments(parser):
+    """Minimal SGLang-shaped args needed by SFT-only/debug-train-only code paths."""
+    parser.add_argument("--sglang-router-ip", type=str, default=None, help="IP address of the SGLang router")
+    parser.add_argument("--sglang-router-port", type=int, default=None, help="Port of the SGLang router")
+    parser.add_argument(
+        "--sglang-router-request-timeout-secs",
+        type=int,
+        default=14400,
+        help="Timeout for requests to the SGLang router in seconds",
+    )
+    parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument("--sglang-data-parallel-size", type=int, default=1)
+    parser.add_argument("--sglang-pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--sglang-expert-parallel-size", type=int, default=1)
+    parser.add_argument("--sglang-enable-dp-attention", action="store_true", default=False)
+    parser.add_argument("--sglang-speculative-algorithm", type=str, default=None)
+    parser.add_argument("--sglang-chat-template", type=str, default=None)
+    parser.add_argument("--sglang-moe-runner-backend", type=str, default="auto")
+    parser.add_argument("--sglang-moe-a2a-backend", type=str, default=None)
+    parser.add_argument("--sglang-enable-metrics", action="store_true", default=False)
+    return parser
+
+
+def _add_sglang_arguments(parser):
+    try:
+        from miles.backends.sglang_utils.arguments import add_sglang_arguments
+    except ModuleNotFoundError as exc:
+        if _missing_sglang_error(exc) and _sft_only_requested():
+            logger.info("SGLang is not installed; using SFT-only argument stub.")
+            return _add_sglang_stub_arguments(parser)
+        raise
+    return add_sglang_arguments(parser)
+
+
+def _validate_sglang_args(args):
+    if getattr(args, "sft_only", False) or getattr(args, "debug_train_only", False):
+        args.sglang_tp_size = args.rollout_num_gpus_per_engine
+        args.sglang_dp_size = getattr(args, "sglang_data_parallel_size", 1)
+        args.sglang_pp_size = getattr(args, "sglang_pipeline_parallel_size", 1)
+        args.sglang_ep_size = getattr(args, "sglang_expert_parallel_size", 1)
+        return
+
+    try:
+        from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
+    except ModuleNotFoundError as exc:
+        if _missing_sglang_error(exc):
+            raise ModuleNotFoundError(
+                "SGLang runtime is required unless --sft-only/--debug-train-only is used."
+            ) from exc
+        raise
+    sglang_validate_args(args)
 
 
 def reset_arg(parser, name, **kwargs):
@@ -1068,7 +1135,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=3,
                 help="Number of consecutive failures before marking a worker as unhealthy.",
             )
-            RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
+            try:
+                from sglang_router.launch_router import RouterArgs
+            except ModuleNotFoundError as exc:
+                if _missing_sglang_error(exc) and _sft_only_requested():
+                    logger.info("SGLang router is not installed; skipping router CLI arguments for SFT-only.")
+                else:
+                    raise
+            else:
+                RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
         # wandb
@@ -1200,6 +1275,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Whether to only run the training without sglang servers. "
                     "This is useful for debugging the rollout generation function."
+                ),
+            )
+            parser.add_argument(
+                "--sft-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Run the SFT/debug-train-only path without requiring SGLang router/server dependencies. "
+                    "This implies --debug-train-only."
                 ),
             )
             parser.add_argument(
@@ -1517,7 +1601,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_tensorboard_arguments(parser)
         parser = add_router_arguments(parser)
         parser = add_debug_arguments(parser)
-        parser = add_sglang_arguments(parser)
+        parser = _add_sglang_arguments(parser)
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
@@ -1592,7 +1676,7 @@ def parse_args(add_custom_arguments=None):
                 "pipeline_model_parallel_size is 1."
             )
 
-    sglang_validate_args(args)
+    _validate_sglang_args(args)
 
     return args
 
@@ -1652,6 +1736,10 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def miles_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if getattr(args, "sft_only", False):
+        logger.info("sft_only is set; enabling debug_train_only and disabling SGLang runtime.")
+        args.debug_train_only = True
 
     if args.chat_template_path == "autofix":
         from miles.utils.chat_template_utils import try_get_fixed_chat_template
@@ -1817,6 +1905,8 @@ def miles_validate_args(args):
     if args.offload_train is None:
         args.offload_train = False
     if args.offload_rollout is None:
+        args.offload_rollout = False
+    if args.debug_train_only:
         args.offload_rollout = False
 
     if args.offload_train:

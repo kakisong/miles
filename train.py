@@ -1,5 +1,13 @@
 import ray
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+
+try:
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+except ModuleNotFoundError:
+    # SFT-only runs never instantiate SGLang engines. Keep the names available so
+    # train.py can be imported from a clean training image without SGLang.
+    GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+    GPU_MEMORY_TYPE_WEIGHTS = "weights"
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from miles.utils.arguments import parse_args

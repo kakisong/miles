@@ -10,9 +10,16 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+try:
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+except ModuleNotFoundError:
+    # SFT-only runs do not create rollout engines, but the manager methods still
+    # reference these tags for the regular rollout path.
+    GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+    GPU_MEMORY_TYPE_WEIGHTS = "weights"
+
 from miles.rollout.base_types import (
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
@@ -52,10 +59,15 @@ class RolloutManager:
 
         self.args = args
         self.pg = pg
-        _start_router(args)
-        # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
-        init_http_client(args)
+        if self.args.debug_train_only:
+            # SFT/debug-train-only only uses this actor as a CPU data/mask producer.
+            # Do not start router or initialize HTTP rollout clients.
+            init_tracking(args, primary=False)
+        else:
+            _start_router(args)
+            # TODO make args immutable
+            init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+            init_http_client(args)
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
@@ -481,6 +493,8 @@ class RolloutManager:
 def init_rollout_engines(args, pg, all_rollout_engines):
     if args.debug_train_only:
         return 0
+
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 
     num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
     num_engines = args.rollout_num_gpus // num_gpu_per_engine

@@ -39,8 +39,6 @@ from .model import forward_only, initialize_model_and_optimizer, save, train
 from .parallel import create_megatron_parallel_state
 from .replay_utils import get_register_replay_list_func
 from .update_weight.common import named_params_and_buffers
-from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
-from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
@@ -146,15 +144,26 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-        self.weight_updater = update_weight_cls(
-            self.args,
-            self.model,
-            weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
-            quantization_config=getattr(self.hf_config, "quantization_config", None),
-            is_lora=is_lora_enabled(args),
-        )
+        self.weight_updater = None
+        if not self.args.debug_train_only:
+            if self.args.colocate:
+                from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+
+                update_weight_cls = UpdateWeightFromTensor
+            else:
+                from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
+
+                update_weight_cls = UpdateWeightFromDistributed
+            self.weight_updater = update_weight_cls(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=type(self.hf_config).__name__.lower()
+                if self.args.model_name is None
+                else self.args.model_name,
+                quantization_config=getattr(self.hf_config, "quantization_config", None),
+                is_lora=is_lora_enabled(args),
+            )
 
         # empty cache after initialization
         clear_memory()
