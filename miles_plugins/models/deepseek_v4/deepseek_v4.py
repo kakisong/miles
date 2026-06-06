@@ -28,7 +28,9 @@ from .ops.compressor import DeepSeekV4Compressor
 from .ops.cp_utils import (
     all_gather_cp,
     get_compress_topk_idxs_cp,
+    get_freqs_cis_for_positions,
     get_freqs_cis_for_cp,
+    get_packed_zigzag_positions_for_cp,
     get_q_positions_for_cp,
     get_window_topk_idxs_cp,
 )
@@ -229,7 +231,19 @@ class DeepSeekV4Attention(MegatronModule):
         x = einops.rearrange(hidden_states, "s b d -> b s d")
 
         bsz, seqlen_local, _ = x.size()
-        freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
+        if packed_seq_params is not None and getattr(packed_seq_params, "cu_seqlens_q", None) is not None:
+            q_positions = get_packed_zigzag_positions_for_cp(
+                packed_seq_params.cu_seqlens_q,
+                cp_size=self.cp_size,
+                cp_group=self.cp_group,
+                local_seqlen=seqlen_local,
+            )
+            freqs_cis = get_freqs_cis_for_positions(self.freqs_cis, q_positions)
+        else:
+            freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
+            q_positions = get_q_positions_for_cp(
+                seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
+            )
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
@@ -252,10 +266,6 @@ class DeepSeekV4Attention(MegatronModule):
         self._debug_tensor("kv_vanilla_after_rope_qat", kv_vanilla)
 
         seqlen_global = seqlen_local * self.cp_size
-        q_positions = get_q_positions_for_cp(
-            seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
-        )
-
         topk_idxs = get_window_topk_idxs_cp(q_positions, window_size=win, cp_size=self.cp_size, bsz=bsz)
 
         if self.compress_ratio:
@@ -267,7 +277,7 @@ class DeepSeekV4Attention(MegatronModule):
                     x_sbd = scatter_to_sequence_parallel_region(x_sbd, group=self.tp_group)
                     qr_sbd = scatter_to_sequence_parallel_region(qr_sbd, group=self.tp_group)
                 if isinstance(self.indexer, V4Indexer):
-                    compress_topk_idxs = self.indexer(x_sbd, qr_sbd)
+                    compress_topk_idxs = self.indexer(x_sbd, qr_sbd, packed_seq_params=packed_seq_params)
                 else:
                     indexer_mask = self._compute_indexer_mask(q_positions=q_positions, seqlen_global=seqlen_global)
                     compress_topk_idxs = self.indexer(x_sbd, qr_sbd, mask=indexer_mask, packed_seq_params=None)
@@ -282,7 +292,7 @@ class DeepSeekV4Attention(MegatronModule):
         kv_compress = None
         if self.compress_ratio:
             x_sbd = einops.rearrange(x, "b s d -> s b d")
-            kv_compress_sbd = self.compressor(x_sbd)
+            kv_compress_sbd = self.compressor(x_sbd, packed_seq_params=packed_seq_params)
             if kv_compress_sbd is not None:
                 kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
 

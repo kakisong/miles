@@ -128,3 +128,84 @@ def get_freqs_cis_for_cp(
     cp_rank = cp_group.rank()
     start = cp_rank * seqlen_local
     return freqs_cis[start : start + seqlen_local : stride]
+
+
+def get_packed_zigzag_positions_for_cp(
+    cu_seqlens: Tensor,
+    *,
+    cp_size: int,
+    cp_group: torch.distributed.ProcessGroup | None,
+    local_seqlen: int,
+) -> Tensor:
+    """Build per-token RoPE positions for Miles packed THD + zigzag CP.
+
+    Miles' default THD CP slicer takes two chunks from each sample on every CP
+    rank: the rank's forward chunk and its mirrored chunk from the end of the
+    padded sequence. The V4 attention code cannot use a single contiguous
+    ``cp_rank * local_seqlen`` offset for packed micro-batches because positions
+    must reset at every packed sample boundary.
+
+    ``cu_seqlens`` uses original/global sequence lengths in PackedSeqParams. In
+    the non-allgather CP path those lengths are exactly ``local_len * cp_size``
+    for each packed segment.
+    """
+
+    cu_seqlens = cu_seqlens.to(dtype=torch.long)
+    device = cu_seqlens.device
+
+    if cp_size <= 1 or cp_group is None:
+        local_cu_seqlens = cu_seqlens
+        idx = torch.arange(local_seqlen, device=device, dtype=torch.long)
+        segment = torch.searchsorted(local_cu_seqlens[1:], idx, right=True)
+        return idx - local_cu_seqlens[segment]
+
+    if bool((cu_seqlens % cp_size != 0).any().item()):
+        raise RuntimeError(
+            f"Packed THD cu_seqlens must be divisible by cp_size={cp_size}; got {cu_seqlens.tolist()}"
+        )
+
+    local_cu_seqlens = cu_seqlens // cp_size
+    if int(local_cu_seqlens[-1].item()) != local_seqlen:
+        raise RuntimeError(
+            "Packed THD local sequence length mismatch: "
+            f"cu_seqlens[-1] / cp_size = {int(local_cu_seqlens[-1].item())}, "
+            f"but hidden_states local_seqlen = {local_seqlen}"
+        )
+
+    local_lengths = local_cu_seqlens[1:] - local_cu_seqlens[:-1]
+    if bool((local_lengths % 2 != 0).any().item()):
+        raise RuntimeError(
+            "Miles zigzag CP expects each packed local segment to contain two equal chunks; "
+            f"got local lengths {local_lengths.tolist()}"
+        )
+
+    cp_rank = cp_group.rank()
+    idx = torch.arange(local_seqlen, device=device, dtype=torch.long)
+    segment = torch.searchsorted(local_cu_seqlens[1:], idx, right=True)
+    segment_start = local_cu_seqlens[segment]
+    local_offset = idx - segment_start
+    chunk = local_lengths[segment] // 2
+
+    return torch.where(
+        local_offset < chunk,
+        cp_rank * chunk + local_offset,
+        (2 * cp_size - cp_rank - 1) * chunk + (local_offset - chunk),
+    )
+
+
+def get_freqs_cis_for_positions(freqs_cis: Tensor, positions: Tensor, *, stride: int = 1) -> Tensor:
+    """Index RoPE frequencies by explicit per-token positions."""
+
+    if stride != 1:
+        positions = positions[::stride]
+
+    if positions.numel() == 0:
+        return freqs_cis[:0]
+
+    max_position = int(positions.max().item())
+    if max_position >= freqs_cis.size(0):
+        raise RuntimeError(
+            f"RoPE position {max_position} exceeds precomputed freqs_cis length {freqs_cis.size(0)}"
+        )
+
+    return freqs_cis.index_select(0, positions.to(device=freqs_cis.device, dtype=torch.long))

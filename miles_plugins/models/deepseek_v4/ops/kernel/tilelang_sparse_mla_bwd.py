@@ -100,7 +100,7 @@ def bwd(
     topk,
     sm_scale=None,
     block_size=32,
-    num_stages=0,
+    num_stages=2,  # H200: SW-pipeline NS loop. Requires mask inlined (no cross-stage dep) + block_H<=32 (smem)
     threads=128,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
@@ -123,7 +123,7 @@ def bwd(
     attn_sink_shape = [H]
 
     padded_H = max(tilelang.math.next_power_of_2(H), 16)
-    block_H = min(64, padded_H)
+    block_H = min(32, padded_H)  # cap 32 so num_stages=2 multibuffering fits 228KB smem
     assert padded_H % block_H == 0
     NH = padded_H // block_H
     BS = block_size
@@ -148,7 +148,6 @@ def bwd(
             Q_shared = T.alloc_shared([block_H, D], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
-            mask = T.alloc_fragment([BS], "bool")
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -166,11 +165,12 @@ def bwd(
             T.clear(acc_dq)
 
             for i_i in T.Pipelined(NS, num_stages=num_stages):
-                for bi_i in T.Parallel(BS):
-                    mask[bi_i] = Indices[by, s_i, i_i * BS + bi_i] != -1
-
+                # mask inlined (no separate `mask` fragment) so the pipeliner doesn't segregate
+                # it into a stage that the KV-gather below depends on backwards.
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
+                    acc_p[h_i, bi_i] = T.if_then_else(
+                        Indices[by, s_i, i_i * BS + bi_i] != -1, 0, -T.infinity(acc_p.dtype)
+                    )
 
                 # Use a safe (in-bounds) index when masked. Otherwise Indices=-1 would
                 # produce raw negative pointer arithmetic — UB in CUDA — which can
@@ -178,7 +178,9 @@ def bwd(
                 for bi_i, d_i in T.Parallel(BS, D):
                     KV_shared[bi_i, d_i] = KV[
                         by,
-                        T.if_then_else(mask[bi_i], Indices[by, s_i, i_i * BS + bi_i], 0),
+                        T.if_then_else(
+                            Indices[by, s_i, i_i * BS + bi_i] != -1, Indices[by, s_i, i_i * BS + bi_i], 0
+                        ),
                         d_i,
                     ]
 

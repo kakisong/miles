@@ -42,7 +42,7 @@ from miles.utils.tracking_utils import init_tracking
 from miles.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, actor_resource_options_from_env
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -99,7 +99,12 @@ class RolloutManager:
             self.all_rollout_engines = [None] * num_engines
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        lock_options = {
+            "num_cpus": 1,
+            "num_gpus": 0,
+            **actor_resource_options_from_env("MILES_ROLLOUT_MANAGER_RESOURCES"),
+        }
+        self.rollout_engine_lock = Lock.options(**lock_options).remote()
         self.rollout_id = -1
 
         self._metric_checker = MetricChecker.maybe_create(args)

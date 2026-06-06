@@ -7,6 +7,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
+from .utils import actor_resource_options_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -167,10 +168,14 @@ def create_training_models(args, pgs, rollout_manager):
 
 
 def create_rollout_manager(args, pg):
-    rollout_manager = RolloutManager.options(
-        num_cpus=1,
-        num_gpus=0,
-    ).remote(args, pg)
+    rollout_manager_options = {
+        "num_cpus": 1,
+        "num_gpus": 0,
+        **actor_resource_options_from_env("MILES_ROLLOUT_MANAGER_RESOURCES"),
+    }
+    if "resources" in rollout_manager_options:
+        logger.info(f"Scheduling RolloutManager with resources: {rollout_manager_options['resources']}")
+    rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None

@@ -18,6 +18,102 @@ from .parallel import ParallelState
 logger = logging.getLogger(__name__)
 
 
+def _safe_mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _attach_batch_schedule_metrics(
+    args: Namespace,
+    parallel_state: ParallelState,
+    rollout_data: RolloutBatch,
+    num_microbatches: list[int],
+    per_step_micro_batch_indices: list[list[list[int]]],
+    num_local_gbs: int,
+    num_microbatches_before_vpp: list[int] | None = None,
+) -> None:
+    """Attach dynamic-batch schedule diagnostics to rollout_data for normal rollout logging."""
+    if not num_microbatches:
+        return
+
+    total_lengths = [int(v) for v in rollout_data["total_lengths"]]
+    response_lengths = [int(v) for v in rollout_data.get("response_lengths", [0] * len(total_lengths))]
+    cp_size = int(parallel_state.cp_size)
+    token_cap = int(args.max_tokens_per_gpu * cp_size) if getattr(args, "max_tokens_per_gpu", None) else 0
+    vpp_size = int(parallel_state.vpp_size)
+    num_microbatches_before_vpp = num_microbatches_before_vpp or list(num_microbatches)
+
+    metrics: dict[str, list[float]] = {
+        "batch_schedule/num_microbatches": [],
+        "batch_schedule/num_microbatches_before_vpp": [],
+        "batch_schedule/token_cap": [],
+        "batch_schedule/step_tokens": [],
+        "batch_schedule/step_response_tokens": [],
+        "batch_schedule/sample_len_mean": [],
+        "batch_schedule/sample_len_max": [],
+        "batch_schedule/response_len_mean": [],
+        "batch_schedule/microbatch_tokens_mean": [],
+        "batch_schedule/microbatch_tokens_min": [],
+        "batch_schedule/microbatch_tokens_max": [],
+        "batch_schedule/microbatch_samples_mean": [],
+        "batch_schedule/microbatch_samples_min": [],
+        "batch_schedule/microbatch_samples_max": [],
+        "batch_schedule/singleton_microbatch_ratio": [],
+        "batch_schedule/cap_waste_tokens": [],
+        "batch_schedule/cap_waste_ratio": [],
+        "batch_schedule/packing_efficiency": [],
+        "batch_schedule/cp_size": [],
+        "batch_schedule/vpp_size": [],
+    }
+
+    for step_id, partitions in enumerate(per_step_micro_batch_indices):
+        start, end = step_id * num_local_gbs, (step_id + 1) * num_local_gbs
+        step_lengths = total_lengths[start:end]
+        step_response_lengths = response_lengths[start:end]
+        microbatch_token_sums = [sum(total_lengths[idx] for idx in partition) for partition in partitions]
+        microbatch_sample_counts = [len(partition) for partition in partitions]
+        step_tokens = sum(step_lengths)
+        step_response_tokens = sum(step_response_lengths)
+        capacity_tokens = num_microbatches[step_id] * token_cap if token_cap else 0
+        cap_waste_tokens = max(capacity_tokens - step_tokens, 0)
+
+        metrics["batch_schedule/num_microbatches"].append(float(num_microbatches[step_id]))
+        metrics["batch_schedule/num_microbatches_before_vpp"].append(float(num_microbatches_before_vpp[step_id]))
+        metrics["batch_schedule/token_cap"].append(float(token_cap))
+        metrics["batch_schedule/step_tokens"].append(float(step_tokens))
+        metrics["batch_schedule/step_response_tokens"].append(float(step_response_tokens))
+        metrics["batch_schedule/sample_len_mean"].append(_safe_mean(step_lengths))
+        metrics["batch_schedule/sample_len_max"].append(float(max(step_lengths) if step_lengths else 0))
+        metrics["batch_schedule/response_len_mean"].append(_safe_mean(step_response_lengths))
+        metrics["batch_schedule/microbatch_tokens_mean"].append(_safe_mean(microbatch_token_sums))
+        metrics["batch_schedule/microbatch_tokens_min"].append(
+            float(min(microbatch_token_sums) if microbatch_token_sums else 0)
+        )
+        metrics["batch_schedule/microbatch_tokens_max"].append(
+            float(max(microbatch_token_sums) if microbatch_token_sums else 0)
+        )
+        metrics["batch_schedule/microbatch_samples_mean"].append(_safe_mean(microbatch_sample_counts))
+        metrics["batch_schedule/microbatch_samples_min"].append(
+            float(min(microbatch_sample_counts) if microbatch_sample_counts else 0)
+        )
+        metrics["batch_schedule/microbatch_samples_max"].append(
+            float(max(microbatch_sample_counts) if microbatch_sample_counts else 0)
+        )
+        metrics["batch_schedule/singleton_microbatch_ratio"].append(
+            _safe_ratio(sum(1 for count in microbatch_sample_counts if count == 1), len(microbatch_sample_counts))
+        )
+        metrics["batch_schedule/cap_waste_tokens"].append(float(cap_waste_tokens))
+        metrics["batch_schedule/cap_waste_ratio"].append(_safe_ratio(cap_waste_tokens, capacity_tokens))
+        metrics["batch_schedule/packing_efficiency"].append(_safe_ratio(step_tokens, capacity_tokens))
+        metrics["batch_schedule/cp_size"].append(float(cp_size))
+        metrics["batch_schedule/vpp_size"].append(float(vpp_size))
+
+    rollout_data.update(metrics)
+
+
 def get_rollout_data(args: Namespace, rollout_data_ref: Box, parallel_state: ParallelState) -> RolloutBatch:
     # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
     # Both first pp stage and the last pp stage will receive the data.
@@ -394,8 +490,19 @@ def get_data_iterator(
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
         return data_iterator
 
+    per_step_micro_batch_indices: list[list[list[int]]] = []
+    num_microbatches_before_vpp: list[int] | None = None
+
     if not args.use_dynamic_batch_size:
         num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
+        for i, num_mbs in enumerate(num_microbatches):
+            start = i * num_local_gbs
+            partitions = [
+                list(range(start + j * args.micro_batch_size, start + (j + 1) * args.micro_batch_size))
+                for j in range(num_mbs)
+            ]
+            per_step_micro_batch_indices.append(partitions)
+        num_microbatches_before_vpp = list(num_microbatches)
         data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:
         assert args.max_tokens_per_gpu is not None
@@ -411,6 +518,7 @@ def get_data_iterator(
 
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
+        num_microbatches_before_vpp = num_microbatches.tolist()
 
         if vpp_size > 1:
             # vpp requies the number of microbatches to be divisible by vpp_size
@@ -432,11 +540,22 @@ def get_data_iterator(
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
                     partitions[j][k] += start
+            per_step_micro_batch_indices.append(partitions)
             micro_batch_indices.extend(partitions)
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
+
+    _attach_batch_schedule_metrics(
+        args,
+        parallel_state,
+        rollout_data,
+        num_microbatches,
+        per_step_micro_batch_indices,
+        num_local_gbs,
+        num_microbatches_before_vpp,
+    )
 
     return (
         data_iterator,

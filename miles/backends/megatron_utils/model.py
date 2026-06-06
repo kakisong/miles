@@ -42,6 +42,106 @@ from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridg
 from .lora_utils import save_lora_checkpoint
 
 
+def _safe_mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _to_int_list(values: Sequence[int | torch.Tensor]) -> list[int]:
+    return [int(v.item() if isinstance(v, torch.Tensor) else v) for v in values]
+
+
+def _collect_train_batch_debug(batch: dict, parallel_state: ParallelState) -> dict[str, float]:
+    total_lengths = _to_int_list(batch["total_lengths"])
+    response_lengths = _to_int_list(batch["response_lengths"])
+    total_tokens = sum(total_lengths)
+    response_tokens = sum(response_lengths)
+    sample_count = len(total_lengths)
+    cp_size = int(parallel_state.cp_size)
+
+    # tokens/full_loss_masks are CP-local after get_batch(); multiply by CP for a
+    # rollout-level approximation that is comparable to total_lengths.
+    local_padded_tokens = int(batch["tokens"].numel())
+    padded_tokens = local_padded_tokens * cp_size
+    pad_tokens = max(padded_tokens - total_tokens, 0)
+    local_loss_tokens = int(batch["full_loss_masks"].sum().item())
+    loss_tokens = local_loss_tokens * cp_size
+
+    max_seq_len = batch.get("max_seqlen", 0)
+    if isinstance(max_seq_len, torch.Tensor):
+        max_seq_len = int(max_seq_len.item())
+    else:
+        max_seq_len = int(max_seq_len or 0)
+
+    return {
+        "sample_count": float(sample_count),
+        "total_tokens": float(total_tokens),
+        "response_tokens": float(response_tokens),
+        "padded_tokens": float(padded_tokens),
+        "pad_tokens": float(pad_tokens),
+        "loss_tokens": float(loss_tokens),
+        "max_seq_len": float(max_seq_len),
+    }
+
+
+def _summarize_train_batch_debug(
+    records: list[dict[str, float]],
+    num_microbatches: int,
+    args: Namespace,
+    parallel_state: ParallelState,
+) -> dict[str, float]:
+    if not records:
+        return {}
+
+    sample_counts = [record["sample_count"] for record in records]
+    total_tokens_by_microbatch = [record["total_tokens"] for record in records]
+    padded_tokens_by_microbatch = [record["padded_tokens"] for record in records]
+    max_seq_lens = [record["max_seq_len"] for record in records]
+    total_tokens = sum(total_tokens_by_microbatch)
+    padded_tokens = sum(padded_tokens_by_microbatch)
+    pad_tokens = sum(record["pad_tokens"] for record in records)
+    response_tokens = sum(record["response_tokens"] for record in records)
+    loss_tokens = sum(record["loss_tokens"] for record in records)
+    token_cap = (
+        float(args.max_tokens_per_gpu * parallel_state.cp_size)
+        if getattr(args, "max_tokens_per_gpu", None) is not None
+        else 0.0
+    )
+    capacity_tokens = float(num_microbatches) * token_cap
+
+    return {
+        "batch/num_microbatches": float(num_microbatches),
+        "batch/debug_records": float(len(records)),
+        "batch/sample_count": float(sum(sample_counts)),
+        "batch/token_cap": token_cap,
+        "batch/tokens": float(total_tokens),
+        "batch/response_tokens": float(response_tokens),
+        "batch/loss_tokens": float(loss_tokens),
+        "batch/padded_tokens": float(padded_tokens),
+        "batch/pad_tokens": float(pad_tokens),
+        "batch/pad_ratio": _safe_ratio(pad_tokens, padded_tokens),
+        "batch/loss_token_ratio": _safe_ratio(loss_tokens, total_tokens),
+        "batch/packing_efficiency": _safe_ratio(total_tokens, capacity_tokens),
+        "batch/padded_packing_efficiency": _safe_ratio(padded_tokens, capacity_tokens),
+        "batch/microbatch_tokens_mean": _safe_mean(total_tokens_by_microbatch),
+        "batch/microbatch_tokens_min": float(min(total_tokens_by_microbatch)),
+        "batch/microbatch_tokens_max": float(max(total_tokens_by_microbatch)),
+        "batch/microbatch_padded_tokens_mean": _safe_mean(padded_tokens_by_microbatch),
+        "batch/microbatch_padded_tokens_max": float(max(padded_tokens_by_microbatch)),
+        "batch/microbatch_samples_mean": _safe_mean(sample_counts),
+        "batch/microbatch_samples_min": float(min(sample_counts)),
+        "batch/microbatch_samples_max": float(max(sample_counts)),
+        "batch/singleton_microbatch_ratio": _safe_ratio(
+            sum(1 for count in sample_counts if count == 1), len(sample_counts)
+        ),
+        "batch/max_seq_len": float(max(max_seq_lens)),
+        "batch/max_seq_len_mean": _safe_mean(max_seq_lens),
+    }
+
+
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
@@ -316,7 +416,7 @@ def train_one_step(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     parallel_state: ParallelState,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, dict[str, float]]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -336,6 +436,8 @@ def train_one_step(
         Reduced loss dictionary (last stage only) and gradient norm for logging.
     """
     args = get_args()
+    batch_debug_records: list[dict[str, float]] = []
+    collect_batch_debug = is_megatron_main_rank()
 
     # Set grad to zero.
     for model_chunk in model:
@@ -389,6 +491,8 @@ def train_one_step(
         )
         batch["debug_rollout_id"] = rollout_id
         batch["debug_step_id"] = step_id
+        if collect_batch_debug:
+            batch_debug_records.append(_collect_train_batch_debug(batch, parallel_state))
 
         from miles.utils.replay_base import all_replay_managers
 
@@ -479,8 +583,12 @@ def train_one_step(
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         loss_reduced = aggregate_train_losses(losses_reduced, parallel_state)
-        return loss_reduced, grad_norm
-    return {}, grad_norm
+        return (
+            loss_reduced,
+            grad_norm,
+            _summarize_train_batch_debug(batch_debug_records, num_microbatches, args, parallel_state),
+        )
+    return {}, grad_norm, {}
 
 
 def finalize_model_grads_with_empty_cache(*args, **kwargs):
@@ -584,7 +692,7 @@ def train(
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
+        loss_dict, grad_norm, batch_debug_metrics = train_one_step(
             args,
             rollout_id,
             step_id,
@@ -635,6 +743,7 @@ def train(
             extra_metrics = {}
             if args.enable_mtp_training:
                 extra_metrics["mtp_loss"] = mtp_losses
+            extra_metrics.update(batch_debug_metrics)
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 extra_metrics[f"lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
