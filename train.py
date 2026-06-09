@@ -72,11 +72,31 @@ def train(args):
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
+    #
+    # --async-rollout-prefetch: double-buffer the rollout data generation. The next rollout's
+    # data (CPU tokenization/packing on the RolloutManager) is generated WHILE the current step
+    # trains on the GPUs, hiding rollout-gen latency behind training instead of exposing it as
+    # idle-GPU train_wait. Safe ONLY when generation is weight-INDEPENDENT (SFT): rollout N+1's
+    # data does not depend on step N's updated weights. For RL/online rollout this would feed
+    # stale-weight generations, so it is gated off by default.
+    prefetch = args.async_rollout_prefetch
+    if prefetch:
+        assert not args.offload_rollout, "--async-rollout-prefetch is incompatible with --offload-rollout"
+        assert not args.use_critic, "--async-rollout-prefetch is not supported with --use-critic"
+        # prime the pipeline with the first rollout's generation (in flight on the RolloutManager)
+        pending_rollout_ref = rollout_manager.generate.remote(args.start_rollout_id)
+
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        if prefetch:
+            rollout_data_ref = ray.get(pending_rollout_ref)
+            # launch the NEXT rollout's data-gen now so it overlaps with async_train() below
+            if rollout_id + 1 < args.num_rollout:
+                pending_rollout_ref = rollout_manager.generate.remote(rollout_id + 1)
+        else:
+            rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
         if args.offload_rollout:
             offload_tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
