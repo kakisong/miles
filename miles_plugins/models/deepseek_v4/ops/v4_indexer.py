@@ -85,7 +85,7 @@ class V4Indexer(MegatronModule):
         Returns:
             topk_indices: [batch, seqlen, index_topk] int64
         """
-        from .cp_utils import get_freqs_cis_for_cp
+        from .cp_utils import get_freqs_cis_for_cp, get_freqs_cis_for_positions, get_packed_zigzag_positions_for_cp
         from .kernel.tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
         from .qat import fp8_simulate_qat
         from .rope import apply_rotary_emb
@@ -105,17 +105,25 @@ class V4Indexer(MegatronModule):
         rd = self.rope_head_dim
         cp_size = parallel_state.get_context_parallel_world_size()
         cp_group = self.pg_collection.cp if hasattr(self.pg_collection, "cp") else None
-        freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen, cp_size, cp_group, stride=1)
-        q = q.clone()
+        if packed_seq_params is not None and getattr(packed_seq_params, "cu_seqlens_q", None) is not None:
+            q_positions = get_packed_zigzag_positions_for_cp(
+                packed_seq_params.cu_seqlens_q,
+                cp_size=cp_size,
+                cp_group=cp_group,
+                local_seqlen=seqlen,
+            )
+            freqs_cis = get_freqs_cis_for_positions(self.freqs_cis, q_positions)
+        else:
+            freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen, cp_size, cp_group, stride=1)
         q = einops.rearrange(q, "s b ... -> b s ...")
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], dim=-1)
         q = einops.rearrange(q, "b s ... -> s b ...")
 
         q = rotate_activation(q)
         if os.environ.get("MEGATRON_USE_KV_QAT", "0") == "1":
-            q = fp8_simulate_qat(q, block_size=128)
+            q = fp8_simulate_qat(q, 128)
 
-        k = self.compressor(x)
+        k = self.compressor(x, packed_seq_params=packed_seq_params)
 
         weights, _ = self.linear_weights_proj(x)
         softmax_scale = self.index_head_dim**-0.5
@@ -134,9 +142,9 @@ class V4Indexer(MegatronModule):
             cu_ke = cu_ke[cp_rank * seqlen : (cp_rank + 1) * seqlen]
         index_scores = batched_indexer_fwd(q, k, weights.float(), cu_ks, cu_ke)
 
-        topk_k = min(self.index_topk, index_scores.size(-1))
-        topk_indices = index_scores.topk(topk_k, dim=-1)[1]
-
+        # NOTE: a redundant `index_scores.topk(...)` used to run here and was immediately
+        # overwritten by the replay-managed topk below (a full [seqlen, ~seqlen_kv] sort done
+        # twice per microbatch). Removed — only the replay topk result is used.
         from miles.utils.replay_base import indexer_replay_manager
 
         def _original_topk(scores, k, **kwargs):

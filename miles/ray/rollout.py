@@ -10,9 +10,16 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+try:
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+except ModuleNotFoundError:
+    # SFT-only runs do not create rollout engines, but the manager methods still
+    # reference these tags for the regular rollout path.
+    GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+    GPU_MEMORY_TYPE_WEIGHTS = "weights"
+
 from miles.rollout.base_types import (
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
@@ -35,7 +42,7 @@ from miles.utils.tracking_utils import init_tracking
 from miles.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, actor_resource_options_from_env
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -52,10 +59,15 @@ class RolloutManager:
 
         self.args = args
         self.pg = pg
-        _start_router(args)
-        # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
-        init_http_client(args)
+        if self.args.debug_train_only:
+            # SFT/debug-train-only only uses this actor as a CPU data/mask producer.
+            # Do not start router or initialize HTTP rollout clients.
+            init_tracking(args, primary=False)
+        else:
+            _start_router(args)
+            # TODO make args immutable
+            init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+            init_http_client(args)
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
@@ -87,7 +99,12 @@ class RolloutManager:
             self.all_rollout_engines = [None] * num_engines
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        lock_options = {
+            "num_cpus": 1,
+            "num_gpus": 0,
+            **actor_resource_options_from_env("MILES_ROLLOUT_MANAGER_RESOURCES"),
+        }
+        self.rollout_engine_lock = Lock.options(**lock_options).remote()
         self.rollout_id = -1
 
         self._metric_checker = MetricChecker.maybe_create(args)
@@ -481,6 +498,8 @@ class RolloutManager:
 def init_rollout_engines(args, pg, all_rollout_engines):
     if args.debug_train_only:
         return 0
+
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 
     num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
     num_engines = args.rollout_num_gpus // num_gpu_per_engine

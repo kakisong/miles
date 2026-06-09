@@ -1,4 +1,6 @@
 from datetime import timedelta
+import logging
+import os
 from typing import Any
 
 import torch
@@ -14,13 +16,67 @@ from torch.distributed.distributed_c10d import (
 )
 
 
+logger = logging.getLogger(__name__)
 GLOO_GROUP = None
+
+
+def _default_route_interface() -> str | None:
+    try:
+        with open("/proc/net/route", encoding="utf-8") as route_file:
+            next(route_file, None)
+            for line in route_file:
+                fields = line.split()
+                if len(fields) >= 4 and fields[1] == "00000000" and int(fields[3], 16) & 2:
+                    return fields[0]
+    except OSError:
+        return None
+    return None
+
+
+def _interface_exists(name: str) -> bool:
+    return bool(name) and os.path.exists(os.path.join("/sys/class/net", name))
+
+
+def _nccl_socket_ifname_valid(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        interfaces = os.listdir("/sys/class/net")
+    except OSError:
+        return False
+    for item in value.split(","):
+        item = item.strip()
+        if not item or item.startswith("^"):
+            continue
+        item = item[1:] if item.startswith("=") else item
+        if item in interfaces or any(iface.startswith(item) for iface in interfaces):
+            return True
+    return False
+
+
+def ensure_socket_ifnames():
+    iface = _default_route_interface()
+    if not iface:
+        return
+
+    gloo_ifname = os.environ.get("GLOO_SOCKET_IFNAME", "")
+    if not _interface_exists(gloo_ifname):
+        if gloo_ifname:
+            logger.warning("GLOO_SOCKET_IFNAME=%s is not present; using %s", gloo_ifname, iface)
+        os.environ["GLOO_SOCKET_IFNAME"] = iface
+
+    nccl_ifname = os.environ.get("NCCL_SOCKET_IFNAME", "")
+    if not _nccl_socket_ifname_valid(nccl_ifname):
+        if nccl_ifname:
+            logger.warning("NCCL_SOCKET_IFNAME=%s is not present; using %s", nccl_ifname, iface)
+        os.environ["NCCL_SOCKET_IFNAME"] = iface
 
 
 def init_gloo_group():
     """Initialize Gloo group for distributed communication."""
     global GLOO_GROUP
     if GLOO_GROUP is None:
+        ensure_socket_ifnames()
         GLOO_GROUP = dist.new_group(backend="gloo")
     return GLOO_GROUP
 

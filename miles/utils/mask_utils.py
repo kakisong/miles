@@ -9,8 +9,14 @@ def get_response_lengths(loss_masks: list[list[int]]) -> list[int]:
 class MultiTurnLossMaskGenerator:
     def __init__(self, tokenizer: AutoTokenizer, tokenizer_type: str = "qwen"):
         self.tokenizer = tokenizer
-        self.system_message_length, self.gen_token_length = self.get_system_message_length()
         self.tokenizer_type = tokenizer_type
+        # Skip Qwen-style probe for V4: V4 has no jinja chat_template (uses
+        # encoding_dsv4.py instead), so apply_chat_template would raise.
+        if tokenizer_type == "deepseek_v4":
+            self.system_message_length = 0
+            self.gen_token_length = 0
+        else:
+            self.system_message_length, self.gen_token_length = self.get_system_message_length()
 
     def get_response_lengths(self, loss_masks: list[list[int]]) -> list[int]:
         return get_response_lengths(loss_masks)
@@ -126,6 +132,98 @@ class MultiTurnLossMaskGenerator:
             loss_mask = [0] * len(token_ids)
         return token_ids, loss_mask
 
+    def gen_multi_turn_loss_mask_deepseek_v4(
+        self, messages: list[dict], tools: list[dict] = None
+    ) -> tuple[list[int], list[int]]:
+        """V4 ships chat template as a Python module (encoding_dsv4.py) instead of jinja.
+
+        Why:
+          tokenizer_config.json's chat_template is empty for DeepSeek-V4 — the
+          official path is `encoding/encoding_dsv4.py` in the model repo.
+        How to apply:
+          loaded lazily from `tokenizer.name_or_path/encoding/encoding_dsv4.py`.
+          Mask=1 for entire assistant render span (reasoning + content + tool_calls + eos),
+          mask=0 elsewhere (incl. transition tokens like `<｜Assistant｜>` / `<think>`).
+
+        Configurable via env vars:
+          MILES_DSV4_THINKING_MODE = "chat" (default) | "thinking"
+          MILES_DSV4_DROP_THINKING = "0" (default) | "1"
+        """
+        import os
+        import sys
+        import importlib.util
+
+        enc = getattr(self, "_dsv4_encoding", None)
+        if enc is None:
+            tk_path = getattr(self.tokenizer, "name_or_path", None) or ""
+            enc_path = os.path.join(tk_path, "encoding", "encoding_dsv4.py")
+            if not os.path.isfile(enc_path):
+                raise FileNotFoundError(
+                    f"DeepSeek-V4 chat-template module not found at {enc_path}. "
+                    "Pass --hf-checkpoint pointing to a V4 HF dir that contains encoding/encoding_dsv4.py."
+                )
+            spec = importlib.util.spec_from_file_location("encoding_dsv4", enc_path)
+            enc = importlib.util.module_from_spec(spec)
+            sys.modules["encoding_dsv4"] = enc
+            spec.loader.exec_module(enc)
+            self._dsv4_encoding = enc
+
+        thinking_mode = os.environ.get("MILES_DSV4_THINKING_MODE", "chat")
+        drop_thinking = os.environ.get("MILES_DSV4_DROP_THINKING", "0") == "1"
+        if thinking_mode not in ("chat", "thinking"):
+            raise ValueError(f"MILES_DSV4_THINKING_MODE must be 'chat' or 'thinking', got {thinking_mode!r}")
+
+        # Pre-process messages the same way encode_messages does, so render_message
+        # sees the same context.
+        full_messages = enc.merge_tool_messages(list(messages))
+        full_messages = enc.sort_tool_results_by_call_order(full_messages)
+        if any(m.get("tools") for m in full_messages):
+            drop_thinking = False
+        if thinking_mode == "thinking" and drop_thinking:
+            full_messages = enc._drop_thinking_messages(full_messages)
+
+        # Render piece-by-piece so we know each message's char span.
+        bos = enc.bos_token
+        pieces: list[tuple[int, int, str]] = []  # (start, end, role)
+        text = bos
+        for i in range(len(full_messages)):
+            rendered = enc.render_message(
+                i, full_messages, thinking_mode=thinking_mode, drop_thinking=drop_thinking
+            )
+            pieces.append((len(text), len(text) + len(rendered), full_messages[i].get("role", "")))
+            text += rendered
+
+        # Tokenize whole conversation with offsets, so we can map char spans → token spans.
+        enc_out = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        token_ids = enc_out["input_ids"]
+        offsets = enc_out["offset_mapping"]
+        loss_mask = [0] * len(token_ids)
+
+        for start, end, role in pieces:
+            if role != "assistant":
+                continue
+            # Mark tokens whose offset is inside [start, end). offsets[k] = (s, e).
+            for k, (s, e) in enumerate(offsets):
+                if s == 0 and e == 0:
+                    continue  # special tokens with no offset
+                if s >= start and e <= end:
+                    loss_mask[k] = 1
+
+        # Per-message override (consistent with other branches).
+        # If a single assistant turn has step_loss_mask=0, zero out that span.
+        for (start, end, role), msg in zip(pieces, full_messages):
+            if role != "assistant":
+                continue
+            if msg.get("step_loss_mask", 1) == 1:
+                continue
+            for k, (s, e) in enumerate(offsets):
+                if s == 0 and e == 0:
+                    continue
+                if s >= start and e <= end:
+                    loss_mask[k] = 0
+
+        return token_ids, loss_mask
+
     def get_loss_mask(self, messages: list[dict], tools: list[dict] = None) -> tuple[list[int], list[int]]:
         if self.tokenizer_type == "qwen":
             if "<｜Assistant｜>" in self.tokenizer.get_added_vocab():
@@ -136,6 +234,8 @@ class MultiTurnLossMaskGenerator:
             return self.gen_multi_turn_loss_mask_qwen3(messages, tools)
         elif self.tokenizer_type == "distill_qwen":
             return self.gen_multi_turn_loss_mask_distill_qwen(messages, tools)
+        elif self.tokenizer_type == "deepseek_v4":
+            return self.gen_multi_turn_loss_mask_deepseek_v4(messages, tools)
         else:
             raise ValueError(f"Unsupported tokenizer type: {self.tokenizer_type}")
 

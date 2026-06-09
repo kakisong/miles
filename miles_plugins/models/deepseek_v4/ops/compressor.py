@@ -6,7 +6,12 @@ import torch.nn as nn
 from megatron.core.transformer.transformer_config import TransformerConfig
 from torch.nn import Linear
 
-from .cp_utils import all_gather_cp, get_freqs_cis_for_cp
+from .cp_utils import (
+    all_gather_cp,
+    get_freqs_cis_for_cp,
+    get_freqs_cis_for_positions,
+    get_packed_zigzag_positions_for_cp,
+)
 from .qat import fp8_simulate_qat
 from .rope import apply_rotary_emb, wrapped_precompute_freqs_cis
 from .utils import rotate_activation
@@ -125,7 +130,7 @@ class DeepSeekV4Compressor(nn.Module):
         start = self.cp_rank * G_local
         return tensor[:, start : start + G_local, :, :]
 
-    def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_raw(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
         assert self.ape.dtype == torch.float32
         assert self.wkv.weight.dtype == torch.float32
         assert self.wgate.weight.dtype == torch.float32
@@ -154,9 +159,19 @@ class DeepSeekV4Compressor(nn.Module):
 
         kv = self.norm(kv.to(dtype))
 
-        freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group, stride=ratio)
+        if packed_seq_params is not None and getattr(packed_seq_params, "cu_seqlens_q", None) is not None:
+            token_positions = get_packed_zigzag_positions_for_cp(
+                packed_seq_params.cu_seqlens_q,
+                cp_size=self.cp_size,
+                cp_group=self.cp_group,
+                local_seqlen=seqlen_local,
+            )
+            freqs_cis = get_freqs_cis_for_positions(self.freqs_cis, token_positions, stride=ratio)
+        else:
+            freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group, stride=ratio)
 
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+        rd = self.rope_head_dim
+        kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], dim=-1)
 
         if self.rotate:
             kv = rotate_activation(kv)
@@ -164,14 +179,19 @@ class DeepSeekV4Compressor(nn.Module):
                 kv = fp8_simulate_qat(kv, 128)
         else:
             if os.environ.get("MEGATRON_USE_KV_QAT", "0") == "1":
-                kv = kv.clone()
-                kv[..., : self.nope_head_dim] = fp8_simulate_qat(kv[..., : self.nope_head_dim], 64)
+                kv = torch.cat(
+                    [
+                        fp8_simulate_qat(kv[..., : self.nope_head_dim].contiguous(), 64),
+                        kv[..., self.nope_head_dim :],
+                    ],
+                    dim=-1,
+                )
             else:
                 pass
 
         return kv
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
         """
         Args:
             x: [seqlen, batch, dim] SBHD layout (Megatron standard)
@@ -179,6 +199,6 @@ class DeepSeekV4Compressor(nn.Module):
             k: [seqlen // compress_ratio, batch, head_dim] SBHD layout
         """
         x_bshd = einops.rearrange(x, "s b d -> b s d")
-        k_bshd = self.forward_raw(x_bshd)
+        k_bshd = self.forward_raw(x_bshd, packed_seq_params=packed_seq_params)
         k = einops.rearrange(k_bshd, "b sc d -> sc b d")
         return k

@@ -15,6 +15,7 @@ def sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
     Returns:
         o: (b, m, h, d)
     """
+    orig_dtype = q.dtype
     q = q.float()
     kv = kv.float()
 
@@ -41,7 +42,12 @@ def sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
     scores = scores.masked_fill(~mask_expanded, float("-inf"))
 
     scores = scores.to(torch.float32)
+    # Combine attn_sink into the LSE shift so fully-masked rows (scores all -inf)
+    # produce sink_term = exp(0) = 1 instead of exp(0 - (-1e30)) = +inf. The +inf
+    # path makes downstream autograd emit `0 * inf = NaN` in d_attn_sink even though
+    # the forward output is valid (0/inf = 0).
     scores_max = scores.max(dim=-1).values
+    scores_max = torch.maximum(scores_max, attn_sink.view(1, 1, h)).clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max.unsqueeze(-1))
 
     numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, kv_gathered.to(torch.float32))
@@ -57,7 +63,7 @@ def sparse_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
 
     o = numerator / denominator.unsqueeze(-1)
 
-    return o.to(q.dtype)
+    return o.to(orig_dtype)
 
 
 def dense_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
@@ -89,8 +95,9 @@ def dense_attn_torch(q, kv, attn_sink, topk_idxs, sm_scale=None):
     attn_mask_expanded = attn_mask.unsqueeze(2).expand(-1, -1, h, -1)
     scores = scores.masked_fill(~attn_mask_expanded, float("-inf"))
 
+    # See sparse_attn_torch above for why we fold attn_sink into the LSE shift.
     scores_max = scores.max(dim=-1, keepdim=True).values
-    scores_max = scores_max.clamp(min=-1e30)
+    scores_max = torch.maximum(scores_max, attn_sink.view(1, 1, h, 1)).clamp(min=-1e30)
 
     exp_scores = torch.exp(scores - scores_max)
 
