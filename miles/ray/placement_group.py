@@ -10,6 +10,7 @@ from miles.utils.async_utils import eager_create_task
 from ..utils.ray_utils import compute_ray_pin_head_options
 from .actor_group import RayTrainGroup
 from .rollout.rollout_manager import RolloutManager
+from .utils import actor_resource_options_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +179,15 @@ async def create_training_models(args, pgs, rollout_manager):
 
 
 def create_rollout_manager(args, pg):
-    rollout_manager = RolloutManager.options(
-        num_cpus=1, num_gpus=0, **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {})
-    ).remote(args, pg)
+    rollout_manager_options = {
+        "num_cpus": 1,
+        "num_gpus": 0,
+        **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {}),
+        **actor_resource_options_from_env("MILES_ROLLOUT_MANAGER_RESOURCES"),
+    }
+    if "resources" in rollout_manager_options:
+        logger.info(f"Scheduling RolloutManager with resources: {rollout_manager_options['resources']}")
+    rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None
