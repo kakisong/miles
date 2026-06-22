@@ -25,6 +25,7 @@ import miles.rollout.sft_rollout_dsv4 as mod
 from miles.rollout.sft_rollout_dsv4 import (
     DeepSeekV4AllButSystemLossMaskGenerator,
     DeepSeekV4LossMaskGenerator,
+    _invalid_sample_reason,
 )
 from miles.utils.types import Sample
 
@@ -340,6 +341,98 @@ def test_entry_points_select_matching_generator(monkeypatch):
     assert sum(allbut.loss_mask) > sum(asst.loss_mask)
     # Its trained tail is the entire non-system remainder (no zeros once it starts).
     assert allbut.loss_mask == [1] * allbut.response_length
+
+
+def _run_batch(entry_fn, convos, monkeypatch, env=None):
+    """Drive an entry point over a batch of conversations; return the kept prompts."""
+    monkeypatch.setattr(mod, "load_tokenizer", lambda *a, **k: CharTokenizer())
+    monkeypatch.setattr(mod, "load_processor", lambda *a, **k: object())
+    monkeypatch.setattr(mod.DeepSeekV4LossMaskGenerator, "_load_dsv4_encoding", lambda self: _fake_enc())
+    mod.TOKENIZER = None
+    mod.PROCESSOR = None
+    mod._MASK_GENERATORS.clear()
+    mod._SAMPLE_PRINTED.clear()
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+
+    groups = [[Sample(prompt=c, metadata={})] for c in convos]
+
+    class _Buf:
+        def get_samples(self, n):
+            return groups
+
+    args = Namespace(
+        rollout_global_dataset=True, hf_checkpoint="x", chat_template_path=None, rollout_batch_size=len(convos)
+    )
+    kept = entry_fn(args, 0, _Buf())
+    return [g[0].prompt for g in kept]
+
+
+def test_invalid_sample_reason_helper():
+    assert _invalid_sample_reason([1, 2, 3], 0, 0) == "empty-loss-mask"
+    assert _invalid_sample_reason([1, 2, 3], 2, 0) is None
+    assert _invalid_sample_reason([1, 2, 3, 4], 2, 3) == "over-length (4 > 3 tokens)"
+    assert _invalid_sample_reason([1, 2, 3], 2, 3) is None  # exactly at the limit is fine
+    assert _invalid_sample_reason([1, 2, 3], 0, 5) == "empty-loss-mask"  # empty mask takes priority
+
+
+# all-but-system on a system-only convo -> no trained token -> empty loss mask (invalid).
+_EMPTY = [{"role": "system", "content": "only system here"}]
+# a long user turn -> over-length once a small MILES_DSV4_SFT_MAX_TOKENS is set.
+_LONG = [{"role": "system", "content": "S"}, {"role": "user", "content": "X" * 200}]
+_VALID_A = [{"role": "system", "content": "S"}, {"role": "user", "content": "hello"}]
+_VALID_B = [{"role": "system", "content": "S"}, {"role": "assistant", "content": "ok"}]
+
+
+def test_skip_invalid_drops_empty_and_overlength(monkeypatch):
+    kept = _run_batch(
+        mod.generate_rollout_all_but_system,
+        [_VALID_A, _EMPTY, _VALID_B, _LONG],
+        monkeypatch,
+        env={"MILES_DSV4_SFT_SKIP_INVALID": "1", "MILES_DSV4_SFT_MAX_TOKENS": "40"},
+    )
+    # empty-loss-mask and over-length are dropped; the two valid samples survive in order.
+    assert kept == [_VALID_A, _VALID_B]
+
+
+def test_invalid_raises_without_skip(monkeypatch):
+    try:
+        _run_batch(mod.generate_rollout_all_but_system, [_VALID_A, _EMPTY], monkeypatch, env={})
+    except ValueError as e:
+        assert "invalid SFT sample" in str(e) and "empty-loss-mask" in str(e)
+    else:
+        raise AssertionError("expected ValueError for empty-loss-mask without skip")
+
+
+def test_max_tokens_zero_only_filters_empty(monkeypatch):
+    kept = _run_batch(
+        mod.generate_rollout_all_but_system,
+        [_LONG, _EMPTY],
+        monkeypatch,
+        env={"MILES_DSV4_SFT_SKIP_INVALID": "1", "MILES_DSV4_SFT_MAX_TOKENS": "0"},
+    )
+    # MAX_TOKENS=0 disables the length check -> only the empty-mask sample drops.
+    assert kept == [_LONG]
+
+
+def test_all_invalid_batch_raises_even_with_skip(monkeypatch):
+    try:
+        _run_batch(
+            mod.generate_rollout_all_but_system,
+            [_EMPTY, [{"role": "system", "content": "another"}]],
+            monkeypatch,
+            env={"MILES_DSV4_SFT_SKIP_INVALID": "1"},
+        )
+    except ValueError as e:
+        assert "all 2 samples" in str(e)
+    else:
+        raise AssertionError("expected ValueError when the entire batch is invalid")
+
+
+def test_assistant_only_unaffected_when_valid(monkeypatch):
+    # The assistant-only entry point shares the filter; a normal convo passes untouched.
+    kept = _run_batch(mod.generate_rollout, [CONVERSATION], monkeypatch, env={})
+    assert kept == [CONVERSATION]
 
 
 if __name__ == "__main__":
