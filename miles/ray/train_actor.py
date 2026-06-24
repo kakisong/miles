@@ -11,7 +11,7 @@ import torch.distributed as dist
 
 import miles.utils.eval_config
 from miles.ray.ray_actor import RayActor
-from miles.utils.distributed_utils import init_gloo_group
+from miles.utils.distributed_utils import ensure_socket_ifnames, init_gloo_group
 from miles.utils.env_report import collect_and_print_node_env_report
 from miles.utils.logging_utils import configure_logger
 from miles.utils.memory_utils import clear_memory, print_memory
@@ -78,6 +78,7 @@ class TrainRayActor(RayActor):
             backend = f"cpu:{cpu_backend},cuda:{args.distributed_backend}"
             logger.info(f"FSDP CPU offload enabled, using hybrid backend: {backend}")
 
+        ensure_socket_ifnames()
         dist.init_process_group(
             backend=backend,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
