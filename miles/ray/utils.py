@@ -1,4 +1,5 @@
 # Adapted from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ray/utils.py#L1
+import json
 import os
 
 import ray
@@ -33,6 +34,21 @@ def get_physical_gpu_id():
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
     return str(props.uuid)
+
+
+def actor_resource_options_from_env(env_var: str):
+    raw = os.environ.get(env_var)
+    if not raw:
+        return {}
+
+    try:
+        resources = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{env_var} must be a JSON object, got: {raw}") from exc
+    if not isinstance(resources, dict):
+        raise ValueError(f"{env_var} must be a JSON object, got: {raw}")
+
+    return {"resources": {str(name): float(value) for name, value in resources.items()}}
 
 
 @ray.remote
