@@ -25,6 +25,7 @@ import miles.rollout.sft_rollout_dsv4 as mod
 from miles.rollout.sft_rollout_dsv4 import (
     DeepSeekV4AllButSystemLossMaskGenerator,
     DeepSeekV4LossMaskGenerator,
+    _invalid_sample_reason,
 )
 from miles.utils.types import Sample
 
@@ -340,6 +341,146 @@ def test_entry_points_select_matching_generator(monkeypatch):
     assert sum(allbut.loss_mask) > sum(asst.loss_mask)
     # Its trained tail is the entire non-system remainder (no zeros once it starts).
     assert allbut.loss_mask == [1] * allbut.response_length
+
+
+def _run_batch(entry_fn, convos, monkeypatch, env=None, rollout_batch_size=None):
+    """Drive an entry point over a stream of conversations; return its RolloutFnTrainOutput
+    (``.samples`` = kept groups, ``.metrics`` = the rollout/sft_skipped_* tally).
+
+    ``convos`` is the *stream* the data buffer serves: ``get_samples(n)`` emits the next
+    ``n`` groups in order (a fresh Sample each, mirroring RolloutDataSource's deepcopy),
+    wrapping when exhausted — so the refill loop can pull replacements for dropped samples.
+    ``rollout_batch_size`` defaults to ``len(convos)`` (single pass, no refill)."""
+    monkeypatch.setattr(mod, "load_tokenizer", lambda *a, **k: CharTokenizer())
+    monkeypatch.setattr(mod, "load_processor", lambda *a, **k: object())
+    monkeypatch.setattr(mod.DeepSeekV4LossMaskGenerator, "_load_dsv4_encoding", lambda self: _fake_enc())
+    mod.TOKENIZER = None
+    mod.PROCESSOR = None
+    mod._MASK_GENERATORS.clear()
+    mod._SAMPLE_PRINTED.clear()
+    mod._SKIP_TOTALS.clear()
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+
+    class _Buf:
+        def __init__(self):
+            self.i = 0
+
+        def get_samples(self, n):
+            out = []
+            for _ in range(n):
+                c = convos[self.i % len(convos)]
+                out.append([Sample(prompt=c, metadata={})])
+                self.i += 1
+            return out
+
+    args = Namespace(
+        rollout_global_dataset=True,
+        hf_checkpoint="x",
+        chat_template_path=None,
+        rollout_batch_size=rollout_batch_size if rollout_batch_size is not None else len(convos),
+    )
+    return entry_fn(args, 0, _Buf())
+
+
+def test_invalid_sample_reason_helper():
+    assert _invalid_sample_reason([1, 2, 3], 0, 0) == "empty-loss-mask"
+    assert _invalid_sample_reason([1, 2, 3], 2, 0) is None
+    assert _invalid_sample_reason([1, 2, 3, 4], 2, 3) == "over-length (4 > 3 tokens)"
+    assert _invalid_sample_reason([1, 2, 3], 2, 3) is None  # exactly at the limit is fine
+    assert _invalid_sample_reason([1, 2, 3], 0, 5) == "empty-loss-mask"  # empty mask takes priority
+
+
+# all-but-system on a system-only convo -> no trained token -> empty loss mask (invalid).
+_EMPTY = [{"role": "system", "content": "only system here"}]
+# a long user turn -> over-length once a small MILES_DSV4_SFT_MAX_TOKENS is set.
+_LONG = [{"role": "system", "content": "S"}, {"role": "user", "content": "X" * 200}]
+_VALID_A = [{"role": "system", "content": "S"}, {"role": "user", "content": "hello"}]
+_VALID_B = [{"role": "system", "content": "S"}, {"role": "assistant", "content": "ok"}]
+
+
+def test_skip_invalid_drops_empty_and_overlength(monkeypatch):
+    # Stream: a full batch of 4 (2 valid, 2 invalid) then 2 valid refills. rbs=4 must
+    # drop the empty-mask + over-length samples and refill back to exactly 4 valid.
+    out = _run_batch(
+        mod.generate_rollout_all_but_system,
+        [_VALID_A, _EMPTY, _VALID_B, _LONG, _VALID_A, _VALID_B],
+        monkeypatch,
+        env={"MILES_DSV4_SFT_SKIP_INVALID": "1", "MILES_DSV4_SFT_MAX_TOKENS": "40"},
+        rollout_batch_size=4,
+    )
+    # Fixed batch size: refilled back to 4 valid groups (no dynamic gbs).
+    assert len(out.samples) == 4
+    assert all(g[0].prompt in (_VALID_A, _VALID_B) for g in out.samples)
+    # ...and the drops are surfaced as the two cumulative rollout/ metrics (one of each).
+    assert out.metrics["rollout/sft_skipped_empty_mask"] == 1
+    assert out.metrics["rollout/sft_skipped_over_length"] == 1
+    # only the two cumulative per-reason keys are reported.
+    assert set(out.metrics) == {"rollout/sft_skipped_empty_mask", "rollout/sft_skipped_over_length"}
+
+
+def test_skip_invalid_refills_to_fixed_batch_size(monkeypatch):
+    # Core regression for fixed gbs: 1 invalid sample interleaved with enough valid ones;
+    # rbs is smaller than the stream so refill kicks in. The rollout must return exactly
+    # `rollout_batch_size` valid groups regardless of the drop.
+    out = _run_batch(
+        mod.generate_rollout_all_but_system,
+        [_VALID_A, _EMPTY, _VALID_B, _VALID_A, _VALID_B],
+        monkeypatch,
+        env={"MILES_DSV4_SFT_SKIP_INVALID": "1"},
+        rollout_batch_size=3,
+    )
+    assert len(out.samples) == 3
+    assert all(g[0].prompt in (_VALID_A, _VALID_B) for g in out.samples)
+    assert out.metrics["rollout/sft_skipped_empty_mask"] == 1
+    assert out.metrics["rollout/sft_skipped_over_length"] == 0
+
+
+def test_invalid_raises_without_skip(monkeypatch):
+    try:
+        _run_batch(mod.generate_rollout_all_but_system, [_VALID_A, _EMPTY], monkeypatch, env={})
+    except ValueError as e:
+        assert "invalid SFT sample" in str(e) and "empty-loss-mask" in str(e)
+    else:
+        raise AssertionError("expected ValueError for empty-loss-mask without skip")
+
+
+def test_max_tokens_zero_only_filters_empty(monkeypatch):
+    # MAX_TOKENS=0 disables the length check -> only the empty-mask sample drops; rbs=2 is
+    # refilled to 2 from the trailing valid sample. _LONG is kept (no length check).
+    out = _run_batch(
+        mod.generate_rollout_all_but_system,
+        [_LONG, _EMPTY, _VALID_A],
+        monkeypatch,
+        env={"MILES_DSV4_SFT_SKIP_INVALID": "1", "MILES_DSV4_SFT_MAX_TOKENS": "0"},
+        rollout_batch_size=2,
+    )
+    assert len(out.samples) == 2
+    assert [g[0].prompt for g in out.samples] == [_LONG, _VALID_A]
+    assert out.metrics["rollout/sft_skipped_empty_mask"] == 1
+    assert out.metrics["rollout/sft_skipped_over_length"] == 0
+
+
+def test_refill_cap_raises_when_data_mostly_invalid(monkeypatch):
+    # Every sample is invalid, so refill can never reach the target. The safety cap
+    # (REFILL_MAX_FACTOR=3 -> pull at most 6) must raise instead of looping forever.
+    try:
+        _run_batch(
+            mod.generate_rollout_all_but_system,
+            [_EMPTY, [{"role": "system", "content": "another"}]],
+            monkeypatch,
+            env={"MILES_DSV4_SFT_SKIP_INVALID": "1", "MILES_DSV4_SFT_REFILL_MAX_FACTOR": "3"},
+        )
+    except ValueError as e:
+        assert "valid SFT samples" in str(e)
+    else:
+        raise AssertionError("expected ValueError when refill cannot reach the target batch size")
+
+
+def test_assistant_only_unaffected_when_valid(monkeypatch):
+    # The assistant-only entry point shares the filter; a normal convo passes untouched.
+    out = _run_batch(mod.generate_rollout, [CONVERSATION], monkeypatch, env={})
+    assert [g[0].prompt for g in out.samples] == [CONVERSATION]
 
 
 if __name__ == "__main__":

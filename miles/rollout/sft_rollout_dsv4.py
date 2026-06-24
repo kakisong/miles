@@ -38,10 +38,25 @@ not which turns are trained, so they apply to both masks)::
 
       MILES_DSV4_THINKING_MODE = "chat" (default) | "thinking"
       MILES_DSV4_DROP_THINKING = "0" (default) | "1"
+
+Invalid-sample handling (both rollouts; a masked sample is *invalid* when its loss mask
+is all-zero — nothing to train on — or its token sequence is over-length)::
+
+      MILES_DSV4_SFT_SKIP_INVALID = "0" (default) | "1"
+          0 -> raise a clear error naming the first invalid sample
+          1 -> drop invalid samples AND refill from the data buffer so each rollout still
+               returns exactly ``rollout_batch_size`` valid samples (fixed global batch
+               size — no dynamic gbs, no downstream trim); drops are logged.
+      MILES_DSV4_SFT_MAX_TOKENS   = "0" (default: length check off) | <int>
+          when > 0, a sample with len(tokens) > N counts as over-length
+      MILES_DSV4_SFT_REFILL_MAX_FACTOR = "10" (default) | <float>
+          refill safety cap: pull at most N * rollout_batch_size groups before giving up
+          (guards a dataset where almost everything is invalid).
 """
 
 import logging
 
+from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_processor, load_tokenizer
 
@@ -338,16 +353,91 @@ PROCESSOR = None
 # the two entry points independent if both are ever exercised in the same process.)
 _MASK_GENERATORS: dict = {}
 _SAMPLE_PRINTED: set = set()
+# Running per-entry-point tally of dropped invalid samples (by reason), accumulated
+# across every rollout batch in this process. The rollout runs in a single long-lived
+# RolloutManager actor, so this is the whole run's total; the warning below echoes it
+# each time a drop happens, so the last `cumulative dropped=` line is the run total
+# (monotonic) — no need to sum the per-batch warnings.
+_SKIP_TOTALS: dict = {}
+
+
+def _invalid_sample_reason(token_ids: list[int], response_length: int, max_tokens: int) -> str | None:
+    """Return a reason string if a masked SFT sample is invalid, else ``None``.
+
+    Two failure modes that crash training downstream:
+      * empty loss mask — nothing to train on (``response_length == 0``, i.e. no token
+        has mask=1). Such a sample has zero trainable tokens; it also trips the
+        ``len(loss_mask) == response_length`` check in train_data_conversion because
+        ``loss_mask[-0:]`` slices the *whole* mask rather than an empty one.
+      * over-length — ``len(token_ids) > max_tokens`` (only when ``max_tokens > 0``);
+        the packed sequence overflows the training token budget.
+    """
+    if response_length == 0:
+        return "empty-loss-mask"
+    if max_tokens > 0 and len(token_ids) > max_tokens:
+        return f"over-length ({len(token_ids)} > {max_tokens} tokens)"
+    return None
+
+
+def _process_group(group, mask_generator, max_tokens, skip_invalid, log_prefix, dropped):
+    """Mask one sample group; return the (mutated) group if valid, else ``None``.
+
+    Valid: writes ``tokens / response_length / reward / loss_mask`` onto the sample and
+    returns the group. Invalid (see :func:`_invalid_sample_reason`): when ``skip_invalid``
+    raise a clear error naming the offender; otherwise tally the reason into ``dropped`` and
+    return ``None`` so the caller can pull a replacement.
+    """
+    (sample,) = group
+    messages = sample.prompt
+    tools = sample.metadata.get("tools", None)
+
+    token_ids, loss_mask = mask_generator.get_loss_mask(messages, tools=tools)
+    response_length = mask_generator.get_response_lengths([loss_mask])[0]
+
+    reason = _invalid_sample_reason(token_ids, response_length, max_tokens)
+    if reason is not None:
+        if not skip_invalid:
+            hint = "." if max_tokens else "; set MILES_DSV4_SFT_MAX_TOKENS=<N> to also filter over-length."
+            raise ValueError(
+                f"{log_prefix}: invalid SFT sample ({reason}). "
+                f"Set MILES_DSV4_SFT_SKIP_INVALID=1 to drop such samples{hint}"
+            )
+        kind = reason.split(" ", 1)[0]  # "empty-loss-mask" | "over-length"
+        dropped[kind] = dropped.get(kind, 0) + 1
+        return None
+
+    sample.tokens = token_ids
+    sample.response_length = response_length
+    sample.reward = 0
+    sample.loss_mask = loss_mask[-response_length:]
+    return group
 
 
 def _run_sft_rollout(args, data_buffer, mask_generator_cls, log_prefix):
     """Shared SFT rollout body for the V4 masks.
 
-    Identical to ``miles.rollout.sft_rollout.generate_rollout`` except the loss mask is
-    always built by ``mask_generator_cls`` (a :class:`DeepSeekV4LossMaskGenerator`
-    subclass), so ``--loss-mask-type`` is ignored; the class selects which V4 mask
-    (assistant-only vs all-but-system) to apply.
+    Mirrors ``miles.rollout.sft_rollout.generate_rollout`` except the loss mask is always
+    built by ``mask_generator_cls`` (a :class:`DeepSeekV4LossMaskGenerator` subclass), so
+    ``--loss-mask-type`` is ignored; the class selects which V4 mask (assistant-only vs
+    all-but-system) to apply.
+
+    Invalid samples (empty loss mask / over-length — see :func:`_invalid_sample_reason`)
+    are controlled by env vars (same ``MILES_DSV4_*`` convention as the thinking knobs):
+      * ``MILES_DSV4_SFT_SKIP_INVALID=1`` drops them, then **refills** from the data buffer
+        so the rollout returns exactly ``rollout_batch_size`` valid samples — the global
+        batch size stays fixed (no dynamic gbs, no downstream trim). The default ``0`` raises
+        a clear error naming the first offender.
+      * ``MILES_DSV4_SFT_MAX_TOKENS=<N>`` enables the over-length check (``0`` = off).
+      * ``MILES_DSV4_SFT_REFILL_MAX_FACTOR=<F>`` caps refilling at ``F * rollout_batch_size``
+        groups pulled (default 10); exceeding it raises rather than looping forever on a
+        mostly-invalid dataset.
+
+    Refilling is safe and resumable: ``data_buffer.get_samples`` advances the dataset offset
+    deterministically (wrapping epochs) and persists it via save/load, so pulling extra just
+    consumes a little more data.
     """
+    import os
+
     assert args.rollout_global_dataset
 
     global TOKENIZER, PROCESSOR
@@ -364,29 +454,84 @@ def _run_sft_rollout(args, data_buffer, mask_generator_cls, log_prefix):
         mask_generator = mask_generator_cls(TOKENIZER)
         _MASK_GENERATORS[mask_generator_cls] = mask_generator
 
-    samples = data_buffer.get_samples(args.rollout_batch_size)
+    skip_invalid = os.environ.get("MILES_DSV4_SFT_SKIP_INVALID", "0") == "1"
+    raw_max = os.environ.get("MILES_DSV4_SFT_MAX_TOKENS", "0") or "0"
+    try:
+        max_tokens = int(raw_max)
+    except ValueError as exc:
+        raise ValueError(f"MILES_DSV4_SFT_MAX_TOKENS must be an integer, got {raw_max!r}") from exc
 
-    for i, sample in enumerate(samples):
-        (sample,) = sample
-        messages = sample.prompt
-        tools = sample.metadata.get("tools", None)
+    raw_factor = os.environ.get("MILES_DSV4_SFT_REFILL_MAX_FACTOR", "10") or "10"
+    try:
+        refill_factor = float(raw_factor)
+    except ValueError as exc:
+        raise ValueError(f"MILES_DSV4_SFT_REFILL_MAX_FACTOR must be a number, got {raw_factor!r}") from exc
 
-        token_ids, loss_mask = mask_generator.get_loss_mask(messages, tools=tools)
+    target = args.rollout_batch_size
+    # Refill safety cap: never pull more than refill_factor * target groups in total.
+    max_pull = max(target, int(target * refill_factor))
 
-        response_length = mask_generator.get_response_lengths([loss_mask])[0]
-
-        sample.tokens = token_ids
-        sample.response_length = response_length
-        sample.reward = 0
-        sample.loss_mask = loss_mask[-response_length:]
-
-        if i == 0 and log_prefix not in _SAMPLE_PRINTED:
-            logger.info(
-                f"{log_prefix}::generate_rollout example data: {sample=} (raw){messages=} (raw){token_ids=} (raw){loss_mask=} {response_length=}"
+    kept: list = []
+    dropped: dict[str, int] = {}
+    pulled = 0
+    # Pull -> filter -> refill the shortfall until we have `target` valid groups. When
+    # skip_invalid is off, _process_group raises on the first invalid sample so this never
+    # iterates twice; when all samples are valid, the first pull already fills the batch.
+    while len(kept) < target:
+        groups = data_buffer.get_samples(target - len(kept))
+        if not groups:
+            break
+        pulled += len(groups)
+        for group in groups:
+            out_group = _process_group(group, mask_generator, max_tokens, skip_invalid, log_prefix, dropped)
+            if out_group is None:
+                continue
+            kept.append(out_group)
+            if len(kept) == 1 and log_prefix not in _SAMPLE_PRINTED:
+                (sample,) = out_group
+                logger.info(
+                    f"{log_prefix}::generate_rollout example data: {sample=} (raw){sample.prompt=} (raw){sample.tokens=} (raw){sample.loss_mask=} {sample.response_length=}"
+                )
+                _SAMPLE_PRINTED.add(log_prefix)
+            if len(kept) == target:
+                break
+        if pulled >= max_pull and len(kept) < target:
+            raise ValueError(
+                f"{log_prefix}: could only collect {len(kept)}/{target} valid SFT samples after "
+                f"pulling {pulled} (cap {max_pull} = {refill_factor}x rollout_batch_size); the data "
+                f"is mostly invalid or MILES_DSV4_SFT_MAX_TOKENS is too strict — raise "
+                f"MILES_DSV4_SFT_REFILL_MAX_FACTOR to pull more."
             )
-            _SAMPLE_PRINTED.add(log_prefix)
 
-    return samples
+    if dropped:
+        totals = _SKIP_TOTALS.setdefault(log_prefix, {})
+        for kind, count in dropped.items():
+            totals[kind] = totals.get(kind, 0) + count
+        logger.warning(
+            "%s: dropped %d invalid SFT samples this rollout (%s); refilled to %d valid "
+            "(pulled %d total). cumulative dropped=%d (%s)",
+            log_prefix,
+            sum(dropped.values()),
+            ", ".join(f"{k}={v}" for k, v in sorted(dropped.items())),
+            len(kept),
+            pulled,
+            sum(totals.values()),
+            ", ".join(f"{k}={v}" for k, v in sorted(totals.items())),
+        )
+
+    # Surface the skip tally to wandb's `rollout/` section (one panel per key). Both keys are
+    # cumulative over the run (the rollout lives in one RolloutManager actor, so _SKIP_TOTALS is
+    # the whole run's tally): the running count of empty-mask and over-length samples dropped so
+    # far. Emitting them every rollout (even at 0) keeps the curves continuous. Returning a
+    # RolloutFnTrainOutput rather than a bare list is the supported way for a rollout fn to
+    # contribute metrics: call_rollout_fn passes it through and _get_rollout_data forwards
+    # `.metrics` to log_rollout_data -> tracking_utils.log.
+    totals = _SKIP_TOTALS.get(log_prefix, {})
+    metrics = {
+        "rollout/sft_skipped_empty_mask": totals.get("empty-loss-mask", 0),
+        "rollout/sft_skipped_over_length": totals.get("over-length", 0),
+    }
+    return RolloutFnTrainOutput(samples=kept, metrics=metrics)
 
 
 def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
