@@ -51,6 +51,9 @@ setup(
         "mlflow": [
             "mlflow>=2.0",
         ],
+        "trackio": [
+            "trackio>=0.27.0",
+        ],
     },
     python_requires=">=3.10",
     classifiers=[

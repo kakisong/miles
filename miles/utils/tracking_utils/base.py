@@ -97,6 +97,31 @@ class MlflowBackend(TrackingBackend):
         mlflow_utils.finish()
 
 
+class TrackioBackend(TrackingBackend):
+    # Delegates to ``trackio_utils``. Holds whether this process should log:
+    # in local mode only the primary rank logs (secondary init returns False).
+
+    def __init__(self) -> None:
+        self._active = False
+
+    def init(self, args, *, primary: bool = True, **kwargs) -> None:
+        from . import trackio_utils
+
+        self._active = trackio_utils.init_trackio(args, primary=primary, **kwargs)
+
+    def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
+        if self._active:
+            from . import trackio_utils
+
+            trackio_utils.log_metrics(metrics, step=step)
+
+    def finish(self) -> None:
+        if self._active:
+            from . import trackio_utils
+
+            trackio_utils.finish()
+
+
 class PrometheusBackend(TrackingBackend):
     # Wraps the existing Ray-actor based prometheus collector. The actor lifetime is
     # tied to the Ray job, so finish() is intentionally a no-op.
@@ -126,6 +151,7 @@ BACKEND_REGISTRY: dict[str, tuple[type[TrackingBackend], str]] = {
     "wandb": (WandbBackend, "use_wandb"),
     "tensorboard": (TensorboardBackend, "use_tensorboard"),
     "mlflow": (MlflowBackend, "use_mlflow"),
+    "trackio": (TrackioBackend, "use_trackio"),
     "prometheus": (PrometheusBackend, "use_prometheus"),
 }
 
