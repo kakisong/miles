@@ -64,6 +64,10 @@ async def train(args):
             if args.rollout_global_dataset:
                 await rollout_manager.save.remote(rollout_id)
 
+        if args.save_epoch_without_optim and num_rollout_per_epoch and (rollout_id + 1) % num_rollout_per_epoch == 0:
+            epoch = (rollout_id + 1) // num_rollout_per_epoch
+            await actor_model.save_model_epoch_optim_free(rollout_id, epoch)
+
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None

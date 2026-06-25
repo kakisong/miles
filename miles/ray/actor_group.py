@@ -125,6 +125,10 @@ class RayTrainGroup:
         """Save actor model"""
         await self._broadcast("save_model", rollout_id, force_sync=force_sync)
 
+    async def save_model_epoch_optim_free(self, rollout_id, epoch):
+        """Save an optimizer-free, model-weights-only checkpoint for the end of an epoch."""
+        await self._broadcast("save_model", rollout_id, force_sync=True, optim_free_epoch=epoch)
+
     async def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
         if self.args.debug_train_only or self.args.debug_rollout_only:

@@ -141,3 +141,25 @@ def test_recompute_logprobs_via_prefill_flag_is_parsed():
     args = parser.parse_args(["--recompute-logprobs-via-prefill"] + REQUIRED_ARGS)
 
     assert args.recompute_logprobs_via_prefill is True
+
+
+def test_save_epoch_without_optim_defaults_off():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(REQUIRED_ARGS)
+
+    assert args.save_epoch_without_optim is False
+    assert args.save_epoch_dir is None
+
+
+def test_save_epoch_without_optim_flags_are_parsed():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(
+        ["--save-epoch-without-optim", "--save-epoch-dir", "/tmp/epoch_ckpts"] + REQUIRED_ARGS
+    )
+
+    assert args.save_epoch_without_optim is True
+    assert args.save_epoch_dir == "/tmp/epoch_ckpts"
