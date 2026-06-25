@@ -51,6 +51,17 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _epoch_ckpt_dir(args, epoch: int) -> str:
+    """Directory for an optimizer-free end-of-epoch checkpoint (see --save-epoch-without-optim).
+
+    Each epoch is a self-contained standard Megatron checkpoint dir (it gets its own
+    ``iter_{rollout_id:07d}/`` and ``latest_checkpointed_iteration.txt`` underneath), so it can be
+    pointed at directly via ``--load`` without colliding with the regular full checkpoints.
+    """
+    root = args.save_epoch_dir or f"{args.save}/epoch_ckpts"
+    return f"{root}/epoch_{epoch:04d}"
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -435,7 +446,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args)
 
     @timer
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    def save_model(self, rollout_id: int, force_sync: bool = False, *, optim_free_epoch: int | None = None) -> None:
         if self.args.debug_rollout_only:
             return
 
@@ -446,7 +457,25 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
 
+            # Drain any async write pending from the previous (periodic) save before we
+            # temporarily repoint args.save below; the pending write used the original path.
             maybe_finalize_async_save(blocking=True)
+
+        if optim_free_epoch is not None:
+            # End-of-epoch lightweight export: model weights only, into a separate directory.
+            # We temporarily repoint args.save and flip args.no_save_optim (both read by Megatron's
+            # save_checkpoint via get_args(), which is the same object as self.args) and force a
+            # synchronous save so the args restoration below cannot race an in-flight async write.
+            epoch_dir = _epoch_ckpt_dir(self.args, optim_free_epoch)
+            saved = (self.args.save, self.args.no_save_optim, self.args.async_save)
+            self.args.save, self.args.no_save_optim, self.args.async_save = epoch_dir, True, False
+            try:
+                save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+            finally:
+                self.args.save, self.args.no_save_optim, self.args.async_save = saved
+            if self.args.offload_train:
+                destroy_process_groups()
+            return
 
         save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
 

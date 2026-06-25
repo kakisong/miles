@@ -110,6 +110,10 @@ async def train(args):
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             await save(rollout_id)
 
+        if args.save_epoch_without_optim and num_rollout_per_epoch and (rollout_id + 1) % num_rollout_per_epoch == 0:
+            epoch = (rollout_id + 1) // num_rollout_per_epoch
+            await actor_model.save_model_epoch_optim_free(rollout_id, epoch)
+
         await offload_train()
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()

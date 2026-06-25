@@ -879,6 +879,28 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--save-epoch-without-optim",
+                action="store_true",
+                default=False,
+                help=(
+                    "At the end of every epoch, additionally save an optimizer-free Megatron "
+                    "checkpoint (model weights only) to a separate directory. This is an extra "
+                    "lightweight snapshot for eval / HF conversion / re-init and does not replace "
+                    "the regular periodic full checkpoints. Requires running in `--num-epoch` mode "
+                    "(so the epoch boundary is known). Megatron backend only."
+                ),
+            )
+            parser.add_argument(
+                "--save-epoch-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Root directory for the optimizer-free per-epoch checkpoints written by "
+                    "--save-epoch-without-optim. Each epoch lands at "
+                    "`{save_epoch_dir}/epoch_{epoch:04d}/`. Defaults to `{save}/epoch_ckpts`."
+                ),
+            )
+            parser.add_argument(
                 "--save-hf",
                 type=str,
                 default=None,
@@ -2171,6 +2193,14 @@ def miles_validate_args(args):
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
+
+    if args.save_epoch_without_optim:
+        assert args.save is not None, "'--save' is required when --save-epoch-without-optim is set."
+        assert args.num_epoch is not None and args.num_rollout is None, (
+            "--save-epoch-without-optim requires running in --num-epoch mode so the epoch "
+            "boundary can be derived from num_rollout_per_epoch. Set --num-epoch and do not "
+            "pass --num-rollout explicitly."
+        )
 
     # Parse LoRA target modules
     if args.lora_rank > 0:
